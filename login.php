@@ -1,53 +1,127 @@
 <?php
 session_start();
-require 'db_connection.php'; // Assumes $pdo is initialized here
+require 'db_connection.php'; // Assumes $pdo is initialized with PDO connection
 
-$error = ""; // Initialize error variable
+// Security headers
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('X-XSS-Protection: 1; mode=block');
+
+// Initialize variables
+$error = '';
+$csrf_token = '';
+
+// Generate CSRF token if not set
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+$csrf_token = $_SESSION['csrf_token'];
+
+/**
+ * Log login attempt to transaction table
+ * @param PDO $pdo Database connection
+ * @param int $user_id User ID or null if failed
+ * @param string $status Success or Failure
+ * @param string $message Log message
+ */
+function logLoginAttempt($pdo, $user_id, $status, $message)
+{
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO transaction (User_id, Transaction_status, Transaction_type, Time, Massage)
+            VALUES (?, ?, ?, NOW(), ?)
+        ");
+        // Transaction_type: 1 for success, 2 for failure
+        $transaction_type = ($status === 'Success') ? 1 : 2;
+        $stmt->execute([$user_id, $status, $transaction_type, $message]);
+    } catch (PDOException $e) {
+        error_log("Failed to log login attempt: " . $e->getMessage(), 3, 'error_log.log');
+    }
+}
+
+/**
+ * Fetch user's department affiliations
+ * @param PDO $pdo Database connection
+ * @param int $user_id User ID
+ * @return array Department IDs
+ */
+function getUserDepartments($pdo, $user_id)
+{
+    try {
+        $stmt = $pdo->prepare("
+            SELECT Department_id 
+            FROM users_department 
+            WHERE User_id = ?
+        ");
+        $stmt->execute([$user_id]);
+        return array_column($stmt->fetchAll(PDO::FETCH_ASSOC), 'Department_id');
+    } catch (PDOException $e) {
+        error_log("Failed to fetch departments: " . $e->getMessage(), 3, 'error_log.log');
+        return [];
+    }
+}
 
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
-    // Sanitize inputs
-    $username = trim(filter_input(INPUT_POST, 'username', FILTER_SANITIZE_FULL_SPECIAL_CHARS) ?? '');
-    $password = trim(filter_input(INPUT_POST, 'password', FILTER_SANITIZE_FULL_SPECIAL_CHARS) ?? '');
-
-    if (empty($username) || empty($password)) {
-        $error = "Username and password are required.";
+    // Validate CSRF token
+    $posted_csrf = filter_input(INPUT_POST, 'csrf_token', FILTER_SANITIZE_STRING) ?? '';
+    if ($posted_csrf !== $_SESSION['csrf_token']) {
+        $error = "Invalid CSRF token.";
+        logLoginAttempt($pdo, null, 'Failure', 'Invalid CSRF token for username: ' . ($_POST['username'] ?? 'unknown'));
     } else {
-        // Fetch user from the database
-        $stmt = $pdo->prepare("SELECT id, username, password, full_name, position, role FROM users WHERE username = ?");
-        $stmt->execute([$username]);
-        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        // Sanitize and validate inputs
+        $username = trim(filter_input(INPUT_POST, 'username', FILTER_SANITIZE_FULL_SPECIAL_CHARS) ?? '');
+        $password = trim(filter_input(INPUT_POST, 'password', FILTER_SANITIZE_FULL_SPECIAL_CHARS) ?? '');
 
-        if ($user && password_verify($password, $user['password'])) {
-            // Regenerate session ID for security
-            session_regenerate_id(true);
-
-            // Set session variables
-            $_SESSION['user_id'] = $user['id'];
-            $_SESSION['username'] = $user['username'];
-            $_SESSION['full_name'] = $user['full_name'];
-            $_SESSION['position'] = $user['position'];
-            $_SESSION['role'] = $user['role'];
-
-            // Fetch user's department affiliations
-            $deptStmt = $pdo->prepare("
-                SELECT department_id, sub_department_id 
-                FROM user_department_affiliations 
-                WHERE user_id = ?
-            ");
-            $deptStmt->execute([$user['id']]);
-            $affiliations = $deptStmt->fetchAll(PDO::FETCH_ASSOC);
-            $_SESSION['departments'] = array_column($affiliations, 'department_id');
-            $_SESSION['sub_departments'] = array_filter(array_column($affiliations, 'sub_department_id'));
-
-            // Redirect based on role: client -> index.php, admin -> admin_dashboard.php
-            $redirect = $user['role'] === 'admin' ? 'admin_dashboard.php' : 'dashboard.php';
-            header("Location: $redirect");
-            exit();
+        if (empty($username) || empty($password)) {
+            $error = "Username and password are required.";
+            logLoginAttempt($pdo, null, 'Failure', 'Empty username or password');
         } else {
-            $error = "Invalid username or password.";
+            try {
+                // Fetch user from database
+                $stmt = $pdo->prepare("
+                    SELECT User_id, Username, Password, Role, Position 
+                    FROM users 
+                    WHERE Username = ?
+                ");
+                $stmt->execute([$username]);
+                $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($user && password_verify($password, $user['Password'])) {
+                    // Regenerate session ID for security
+                    session_regenerate_id(true);
+
+                    // Set session variables
+                    $_SESSION['user_id'] = $user['User_id'];
+                    $_SESSION['username'] = $user['Username'];
+                    $_SESSION['role'] = $user['Role'];
+                    $_SESSION['position'] = $user['Position'];
+                    $_SESSION['departments'] = getUserDepartments($pdo, $user['User_id']);
+                    // No sub_departments table in schema, set as empty
+                    $_SESSION['sub_departments'] = [];
+
+                    // Log successful login
+                    logLoginAttempt($pdo, $user['User_id'], 'Success', 'User logged in successfully');
+
+                    // Redirect based on role
+                    $redirect = ($user['Role'] === 'admin') ? 'admin_dashboard.php' : 'Dashboard.php';
+                    header("Location: $redirect");
+                    exit();
+                } else {
+                    $error = "Invalid username or password.";
+                    logLoginAttempt($pdo, null, 'Failure', "Invalid login attempt for username: $username");
+                }
+            } catch (PDOException $e) {
+                error_log("Database error: " . $e->getMessage(), 3, 'error_log.log');
+                $error = "An error occurred. Please try again later.";
+            }
         }
     }
 }
+
+// Disable error display in production
+ini_set('display_errors', 0);
+ini_set('display_startup_errors', 0);
+error_reporting(E_ALL);
 ?>
 
 <!DOCTYPE html>
@@ -138,10 +212,11 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     <div class="login-container">
         <h2>Login</h2>
         <?php if (!empty($error)): ?>
-            <p class="error"><?php echo htmlspecialchars($error); ?></p>
+            <p class="error"><?php echo htmlspecialchars($error, ENT_QUOTES, 'UTF-8'); ?></p>
         <?php endif; ?>
         <form action="login.php" method="POST">
-            <input type="text" name="username" placeholder="Username" value="<?php echo isset($username) ? htmlspecialchars($username) : ''; ?>" required>
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf_token, ENT_QUOTES, 'UTF-8'); ?>">
+            <input type="text" name="username" placeholder="Username" value="<?php echo isset($username) ? htmlspecialchars($username, ENT_QUOTES, 'UTF-8') : ''; ?>" required>
             <input type="password" name="password" placeholder="Password" required>
             <button type="submit">Login</button>
         </form>

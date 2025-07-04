@@ -1,7 +1,7 @@
 <?php
 // Configuration using environment variables for security
 $host = getenv('DB_HOST') ?: 'localhost';
-$dbname = getenv('DB_NAME') ?: 'arc-hive';
+$dbname = getenv('DB_NAME') ?: 'arc-hive-mainDB';
 $username = getenv('DB_USER') ?: 'root';
 $password = getenv('DB_PASS') ?: '';
 

@@ -1,11 +1,12 @@
 <?php
 session_start();
 require 'db_connection.php';
+require 'log_activity.php';
 
-// Security: Validate session and regenerate ID for security
+// Security: Validate session and regenerate ID
 if (!isset($_SESSION['user_id'])) {
     header('Location: login.php');
-    exit();
+    exit;
 }
 session_regenerate_id(true);
 
@@ -14,152 +15,148 @@ if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-$userId = $_SESSION['user_id'];
-$userRole = $_SESSION['role'];
+$userId = filter_var($_SESSION['user_id'], FILTER_SANITIZE_NUMBER_INT);
+$userRole = filter_var($_SESSION['role'] ?? 'user', FILTER_SANITIZE_STRING);
 
-// Sanitize inputs
-$userId = filter_var($userId, FILTER_SANITIZE_NUMBER_INT);
-
-// Fetch user details including department and sub-department
+// Fetch user details including department
 $stmt = $pdo->prepare("
-    SELECT users.*, 
-           d.id AS department_id, 
-           d.name AS department_name, 
-           sd.id AS sub_department_id, 
-           sd.name AS sub_department_name 
-    FROM users 
-    LEFT JOIN user_department_affiliations uda ON users.id = uda.user_id 
-    LEFT JOIN departments d ON uda.department_id = d.id 
-    LEFT JOIN sub_departments sd ON uda.sub_department_id = sd.id 
-    WHERE users.id = ? 
+    SELECT u.User_id, u.Username, u.Role, u.Profile_pic, u.Position, 
+           d.Department_id, d.Department_name
+    FROM users u
+    LEFT JOIN users_department ud ON u.User_id = ud.User_id
+    LEFT JOIN departments d ON ud.Department_id = d.Department_id
+    WHERE u.User_id = ?
     LIMIT 1
 ");
 $stmt->execute([$userId]);
 $user = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$user) {
+    error_log("User not found for ID: $userId");
+    header('Location: logout.php');
+    exit;
+}
 
-// Fetch all user department and sub-department affiliations
+// Fetch user departments
 $stmt = $pdo->prepare("
-    SELECT d.id AS department_id, 
-           d.name AS department_name, 
-           sd.id AS sub_department_id, 
-           sd.name AS sub_department_name 
-    FROM departments d 
-    JOIN user_department_affiliations uda ON d.id = uda.department_id 
-    LEFT JOIN sub_departments sd ON uda.sub_department_id = sd.id 
-    WHERE uda.user_id = ?
+    SELECT d.Department_id, d.Department_name
+    FROM departments d
+    JOIN users_department ud ON d.Department_id = ud.Department_id
+    WHERE ud.User_id = ?
 ");
 $stmt->execute([$userId]);
 $userDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-if (empty($userDepartments) && !empty($user['department_id'])) {
-    $userDepartments = [[
-        'department_id' => $user['department_id'],
-        'department_name' => $user['department_name'],
-        'sub_department_id' => $user['sub_department_id'],
-        'sub_department_name' => $user['sub_department_name']
-    ]];
-}
-
-// Fetch document types for sorting
-$stmt = $pdo->prepare("SELECT name FROM document_types ORDER BY name ASC");
+// Fetch document types
+$stmt = $pdo->prepare("SELECT DISTINCT Field_name AS name FROM documents_type_fields ORDER BY Field_name ASC");
 $stmt->execute();
 $docTypes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch recent files, notifications, activity logs, and all files
-$stmt = $pdo->prepare("SELECT * FROM files WHERE user_id = ? ORDER BY upload_date DESC LIMIT 5");
+// Fetch recent files (owned by user)
+$stmt = $pdo->prepare("
+    SELECT f.File_id, f.File_name, f.File_type, f.Upload_date, f.Copy_type, dtf.Field_name AS document_type
+    FROM files f
+    LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+    WHERE f.User_id = ? AND f.File_status != 'deleted'
+    ORDER BY f.Upload_date DESC
+    LIMIT 5
+");
 $stmt->execute([$userId]);
 $recentFiles = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt = $pdo->prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5");
+// Fetch notifications (Transaction_type = 12)
+$stmt = $pdo->prepare("
+    SELECT t.Transaction_id AS id, t.File_id, t.Transaction_status AS status, t.Time AS timestamp, t.Massage AS message,
+           COALESCE(f.File_name, 'Unknown File') AS file_name
+    FROM transaction t
+    LEFT JOIN files f ON t.File_id = f.File_id
+    WHERE t.User_id = ? AND t.Transaction_type = 12
+    AND (f.File_status != 'deleted' OR f.File_id IS NULL)
+    ORDER BY t.Time DESC
+    LIMIT 5
+");
 $stmt->execute([$userId]);
 $notificationLogs = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt = $pdo->prepare("SELECT * FROM activity_log WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5");
+// Fetch activity logs (excluding notifications)
+$stmt = $pdo->prepare("
+    SELECT t.Transaction_id, t.Massage AS action, t.Time AS timestamp
+    FROM transaction t
+    LEFT JOIN files f ON t.File_id = f.File_id
+    WHERE t.User_id = ? AND t.Transaction_type != 12
+    AND (f.File_status != 'deleted' OR f.File_id IS NULL)
+    ORDER BY t.Time DESC
+    LIMIT 5
+");
 $stmt->execute([$userId]);
 $activityLogs = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+// Fetch all user files
 $stmt = $pdo->prepare("
-    SELECT files.*, document_types.name AS document_type 
-    FROM files 
-    LEFT JOIN document_types ON files.document_type_id = document_types.id 
-    WHERE files.user_id = ? 
-    ORDER BY files.upload_date DESC
-");
-$stmt->execute([$userId]);
-$files = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Fetch files sent to the user
-$stmt = $pdo->prepare("
-    SELECT DISTINCT files.*, document_types.name AS document_type
-    FROM files
-    JOIN file_owners fo ON files.id = fo.file_id
-    JOIN file_transfers ft ON files.id = ft.file_id
-    LEFT JOIN document_types ON files.document_type_id = document_types.id
-    WHERE fo.user_id = ? AND fo.ownership_type = 'co-owner'
-    ORDER BY files.upload_date DESC
-");
-$stmt->execute([$userId]);
-$filesSentToMe = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Fetch files uploaded by the user
-$stmt = $pdo->prepare("
-    SELECT files.*, document_types.name AS document_type
-    FROM files
-    JOIN file_owners fo ON files.id = fo.file_id
-    LEFT JOIN document_types ON files.document_type_id = document_types.id
-    WHERE fo.user_id = ? AND fo.ownership_type = 'original'
-    ORDER BY files.upload_date DESC
+    SELECT f.File_id, f.File_name, f.File_type, f.Upload_date, f.Copy_type, dtf.Field_name AS document_type
+    FROM files f
+    LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+    WHERE f.User_id = ? AND f.File_status != 'deleted'
+    ORDER BY f.Upload_date DESC
 ");
 $stmt->execute([$userId]);
 $filesUploaded = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch files requested by the user
+// Fetch files sent to user (Transaction_type = 2)
 $stmt = $pdo->prepare("
-    SELECT files.*, document_types.name AS document_type
-    FROM files
-    JOIN access_requests ar ON files.id = ar.file_id
-    LEFT JOIN document_types ON files.document_type_id = document_types.id
-    WHERE ar.requester_id = ? AND ar.status = 'pending'
-    ORDER BY ar.time_requested DESC
+    SELECT DISTINCT f.File_id, f.File_name, f.File_type, f.Upload_date, f.Copy_type, dtf.Field_name AS document_type
+    FROM files f
+    JOIN transaction t ON f.File_id = t.File_id
+    LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+    WHERE t.User_id = ? AND t.Transaction_type = 2
+    AND t.Transaction_status IN ('pending', 'accepted')
+    AND f.File_status != 'deleted'
+    ORDER BY f.Upload_date DESC
+");
+$stmt->execute([$userId]);
+$filesSentToMe = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// Fetch files requested by user (Transaction_type = 10)
+$stmt = $pdo->prepare("
+    SELECT DISTINCT f.File_id, f.File_name, f.File_type, f.Upload_date, f.Copy_type, dtf.Field_name AS document_type
+    FROM files f
+    JOIN transaction t ON f.File_id = t.File_id
+    LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+    WHERE t.User_id = ? AND t.Transaction_type = 10
+    AND t.Transaction_status = 'pending'
+    AND f.File_status != 'deleted'
+    ORDER BY t.Time DESC
 ");
 $stmt->execute([$userId]);
 $filesRequested = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch department and sub-department files
+// Fetch department files
 $departmentFiles = [];
 foreach ($userDepartments as $dept) {
-    $deptId = $dept['department_id'];
-    $subDeptId = $dept['sub_department_id'];
-
-    // Department-wide files
+    $deptId = $dept['Department_id'];
     $stmt = $pdo->prepare("
-        SELECT files.*, document_types.name AS document_type
-        FROM files
-        JOIN file_transfers ft ON files.id = ft.file_id
-        LEFT JOIN document_types ON files.document_type_id = document_types.id
-        WHERE ft.department_id = ? AND ft.status = 'accepted'
-        ORDER BY files.upload_date DESC
+        SELECT f.File_id, f.File_name, f.File_type, f.Upload_date, f.Copy_type, dtf.Field_name AS document_type
+        FROM files f
+        JOIN transaction t ON f.File_id = t.File_id
+        LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+        WHERE t.Users_Department_id IN (
+            SELECT Users_Department_id FROM users_department WHERE Department_id = ? AND User_id = ?
+        )
+        AND t.Transaction_type = 2
+        AND t.Transaction_status = 'accepted'
+        AND f.File_status != 'deleted'
+        ORDER BY f.Upload_date DESC
     ");
-    $stmt->execute([$deptId]);
-    $departmentFiles[$deptId]['department'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    // Sub-department files
-    if ($subDeptId) {
-        $stmt = $pdo->prepare("
-            SELECT files.*, document_types.name AS document_type
-            FROM files
-            JOIN file_transfers ft ON files.id = ft.file_id
-            JOIN file_metadata fm ON files.id = fm.file_id
-            LEFT JOIN document_types ON files.document_type_id = document_types.id
-            WHERE fm.meta_key = 'sub_department_id' AND fm.meta_value = ?
-            ORDER BY files.upload_date DESC
-        ");
-        $stmt->execute([$subDeptId]);
-        $departmentFiles[$deptId]['sub_department'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
+    $stmt->execute([$deptId, $userId]);
+    $departmentFiles[$deptId] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
-function getFileIcon($fileName)
+/**
+ * Returns Font Awesome icon class based on file extension.
+ *
+ * @param string $fileName
+ * @return string
+ */
+function getFileIcon(string $fileName): string
 {
     $extension = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
     switch ($extension) {
@@ -202,9 +199,76 @@ function getFileIcon($fileName)
     <link rel="stylesheet" href="style/Dashboard.css">
     <link rel="stylesheet" href="style/client-sidebar.css">
     <style>
-        /* Fix for Select2 dropdown z-index */
         .select2-container--open .select2-dropdown {
             z-index: 3000 !important;
+        }
+
+        .file-item {
+            cursor: pointer;
+            padding: 10px;
+            border: 1px solid #ddd;
+            margin: 5px;
+        }
+
+        .file-item.selected {
+            background-color: #e6f3ff;
+            border-color: #007bff;
+        }
+
+        .popup-questionnaire {
+            display: none;
+            padding: 20px;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+        }
+
+        .notification-item.pending-access {
+            background: #fff3cd;
+        }
+
+        .notification-item.processed-access {
+            background: #d4edda;
+        }
+
+        .hard-copy-indicator {
+            font-size: 0.8em;
+            color: #555;
+        }
+
+        .file-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+        }
+
+        .log-entries {
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .btn-back,
+        .btn-next {
+            padding: 8px 16px;
+            margin: 5px;
+        }
+
+        .exit-button {
+            float: right;
+            font-size: 1.2em;
+            cursor: pointer;
+        }
+
+        .hardcopy-options {
+            margin-top: 10px;
+        }
+
+        .radio-group {
+            margin: 10px 0;
+        }
+
+        .storage-suggestion {
+            margin: 10px 0;
         }
     </style>
 </head>
@@ -216,40 +280,41 @@ function getFileIcon($fileName)
         <?php if ($userRole === 'admin'): ?>
             <a href="admin_dashboard.php" class="admin-dashboard-btn" data-tooltip="Admin Dashboard"><i class="fas fa-user-shield"></i><span class="link-text">Admin Dashboard</span></a>
         <?php endif; ?>
-        <a href="dashboard.php" class="<?= basename($_SERVER['PHP_SELF']) == 'index.php' ? 'active' : '' ?>" data-tooltip="Dashboard"><i class="fas fa-home"></i><span class="link-text">Dashboard</span></a>
+        <a href="dashboard.php" class="<?= htmlspecialchars(basename($_SERVER['PHP_SELF']) === 'dashboard.php' ? 'active' : '') ?>" data-tooltip="Dashboard"><i class="fas fa-home"></i><span class="link-text">Dashboard</span></a>
         <a href="my-report.php" data-tooltip="My Report"><i class="fas fa-chart-bar"></i><span class="link-text">My Report</span></a>
-        <a href="my-folder.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-folder.php' ? 'active' : '' ?>" data-tooltip="My Folder"><i class="fas fa-folder"></i><span class="link-text">My Folder</span></a>
-        <?php if (!empty($userDepartments)): ?>
-            <?php foreach ($userDepartments as $dept): ?>
-                <a href="department_folder.php?department_id=<?= htmlspecialchars($dept['department_id']) ?>"
-                    class="<?= isset($_GET['department_id']) && $_GET['department_id'] == $dept['department_id'] ? 'active' : '' ?>"
-                    data-tooltip="<?= htmlspecialchars($dept['department_name'] ?? 'Unnamed Department') ?>">
-                    <i class="fas fa-folder"></i>
-                    <span class="link-text"><?= htmlspecialchars($dept['department_name'] ?? 'Unnamed Department') ?></span>
-                </a>
-            <?php endforeach; ?>
-        <?php endif; ?>
+        <a href="my-folder.php" class="<?= htmlspecialchars(basename($_SERVER['PHP_SELF']) === 'my-folder.php' ? 'active' : '') ?>" data-tooltip="My Folder"><i class="fas fa-folder"></i><span class="link-text">My Folder</span></a>
+        <?php foreach ($userDepartments as $dept): ?>
+            <a href="department_folder.php?department_id=<?= htmlspecialchars($dept['Department_id']) ?>"
+                class="<?= isset($_GET['department_id']) && (int)$_GET['department_id'] === $dept['Department_id'] ? 'active' : '' ?>"
+                data-tooltip="<?= htmlspecialchars($dept['Department_name'] ?? 'Unnamed Department') ?>">
+                <i class="fas fa-folder"></i>
+                <span class="link-text"><?= htmlspecialchars($dept['Department_name'] ?? 'Unnamed Department') ?></span>
+            </a>
+        <?php endforeach; ?>
         <a href="logout.php" class="logout-btn" data-tooltip="Logout"><i class="fas fa-sign-out-alt"></i><span class="link-text">Logout</span></a>
     </div>
 
     <div class="top-nav">
         <h2>Dashboard</h2>
         <form action="search.php" method="GET" class="search-container" id="search-form">
-            <input type="text" id="searchInput" name="q" placeholder="Search documents..." value="<?= htmlspecialchars($searchQuery ?? '') ?>">
+            <input type="text" id="searchInput" name="q" placeholder="Search documents..." value="<?= htmlspecialchars($_GET['q'] ?? '') ?>">
             <select name="type" id="document-type">
                 <option value="">All Document Types</option>
                 <?php foreach ($docTypes as $type): ?>
-                    <option value="<?= htmlspecialchars($type['name']) ?>" <?= ($documentType ?? '') === $type['name'] ? 'selected' : '' ?>><?= htmlspecialchars(ucfirst($type['name'])) ?></option>
+                    <option value="<?= htmlspecialchars($type['name']) ?>" <?= ($_GET['type'] ?? '') === $type['name'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars(ucfirst($type['name'])) ?>
+                    </option>
                 <?php endforeach; ?>
             </select>
             <select name="folder" id="folder">
                 <option value="">All Folders</option>
-                <option value="my-folder" <?= ($folderFilter ?? '') === 'my-folder' ? 'selected' : '' ?>>My Folder</option>
-                <?php if (!empty($userDepartments)): ?>
-                    <?php foreach ($userDepartments as $dept): ?>
-                        <option value="department-<?= $dept['department_id'] ?>" <?= ($folderFilter ?? '') === 'department-' . $dept['department_id'] ? 'selected' : '' ?>><?= htmlspecialchars($dept['department_name']) ?></option>
-                    <?php endforeach; ?>
-                <?php endif; ?>
+                <option value="my-folder" <?= ($_GET['folder'] ?? '') === 'my-folder' ? 'selected' : '' ?>>My Folder</option>
+                <?php foreach ($userDepartments as $dept): ?>
+                    <option value="department-<?= htmlspecialchars($dept['Department_id']) ?>"
+                        <?= ($_GET['folder'] ?? '') === 'department-' . $dept['Department_id'] ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($dept['Department_name']) ?>
+                    </option>
+                <?php endforeach; ?>
             </select>
             <button type="submit" aria-label="Search Documents"><i class="fas fa-search"></i></button>
         </form>
@@ -259,11 +324,12 @@ function getFileIcon($fileName)
     <div class="main-content">
         <div class="user-id-calendar-container">
             <div class="user-id">
-                <img src="<?php echo htmlspecialchars($user['profile_pic'] ?? 'user.jpg'); ?>" alt="User Picture" class="user-picture">
+                <img src="<?= htmlspecialchars($user['Profile_pic'] ? 'data:image/jpeg;base64,' . base64_encode($user['Profile_pic']) : 'user.jpg') ?>"
+                    alt="User Picture" class="user-picture">
                 <div class="user-info">
-                    <p class="user-name"><?= htmlspecialchars($user['full_name']) ?></p>
-                    <p class="user-position"><?= htmlspecialchars($user['position']) ?></p>
-                    <p class="user-department"><?= htmlspecialchars($user['department_name'] ?? 'No Department') ?></p>
+                    <p class="user-name"><?= htmlspecialchars($user['Username'] ?? 'Unknown User') ?></p>
+                    <p class="user-position"><?= htmlspecialchars($user['Position'] ?? 'No Position') ?></p>
+                    <p class="user-department"><?= htmlspecialchars($user['Department_name'] ?? 'No Department') ?></p>
                 </div>
             </div>
             <div class="digital-calendar-clock">
@@ -286,11 +352,10 @@ function getFileIcon($fileName)
                 <div class="log-entries">
                     <?php if (!empty($notificationLogs)): ?>
                         <?php foreach ($notificationLogs as $notification): ?>
-                            <div class="log-entry notification-item <?= $notification['type'] === 'access_request' && $notification['status'] === 'pending' ? 'pending-access' : ($notification['type'] === 'received' && $notification['status'] === 'pending' ? 'received-pending' : '') ?>"
+                            <div class="log-entry notification-item <?= $notification['status'] === 'pending' ? 'pending-access' : 'processed-access' ?>"
                                 data-notification-id="<?= htmlspecialchars($notification['id']) ?>"
-                                data-file-id="<?= htmlspecialchars($notification['file_id']) ?>"
+                                data-file-id="<?= htmlspecialchars($notification['file_id'] ?? '') ?>"
                                 data-message="<?= htmlspecialchars($notification['message']) ?>"
-                                data-type="<?= htmlspecialchars($notification['type']) ?>"
                                 data-status="<?= htmlspecialchars($notification['status']) ?>">
                                 <i class="fas fa-bell"></i>
                                 <p><?= htmlspecialchars($notification['message']) ?></p>
@@ -308,7 +373,6 @@ function getFileIcon($fileName)
 
         <div class="owned-files-section">
             <h2>My Files</h2>
-
             <div class="files-grid">
                 <div class="file-subsection">
                     <h3>My Documents</h3>
@@ -324,7 +388,9 @@ function getFileIcon($fileName)
                             <select class="sort-personal-type" onchange="sortPersonalFiles()">
                                 <option value="">Select</option>
                                 <?php foreach ($docTypes as $type): ?>
-                                    <option value="type-<?= htmlspecialchars($type['name']) ?>"><?= htmlspecialchars(ucfirst($type['name'])) ?></option>
+                                    <option value="type-<?= htmlspecialchars($type['name']) ?>">
+                                        <?= htmlspecialchars(ucfirst($type['name'])) ?>
+                                    </option>
                                 <?php endforeach; ?>
                             </select>
                             <label>Sort by Source:</label>
@@ -339,23 +405,22 @@ function getFileIcon($fileName)
                             <label><input type="checkbox" id="hardCopyPersonalFilter" onchange="filterPersonalFilesByHardCopy()"> Hard Copy Only</label>
                         </div>
                     </div>
-
                     <div class="file-grid" id="personalFiles">
                         <?php if (!empty($filesUploaded) || !empty($filesSentToMe) || !empty($filesRequested)): ?>
                             <?php foreach (array_merge($filesUploaded, $filesSentToMe, $filesRequested) as $file): ?>
                                 <div class="file-item"
-                                    data-file-id="<?= htmlspecialchars($file['id']) ?>"
-                                    data-file-name="<?= htmlspecialchars($file['file_name']) ?>"
-                                    data-document-type="<?= htmlspecialchars($file['document_type']) ?>"
-                                    data-upload-date="<?= $file['upload_date'] ?>"
-                                    data-hard-copy="<?= $file['hard_copy_available'] ?>"
+                                    data-file-id="<?= htmlspecialchars($file['File_id']) ?>"
+                                    data-file-name="<?= htmlspecialchars($file['File_name']) ?>"
+                                    data-document-type="<?= htmlspecialchars($file['document_type'] ?? 'Unknown') ?>"
+                                    data-upload-date="<?= htmlspecialchars($file['Upload_date']) ?>"
+                                    data-hard-copy="<?= htmlspecialchars($file['Copy_type'] === 'hard' ? '1' : '0') ?>"
                                     data-source="<?= in_array($file, $filesUploaded) ? 'uploaded' : (in_array($file, $filesSentToMe) ? 'received' : 'requested') ?>">
-                                    <i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i>
-                                    <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                                    <p class="file-type"><?= htmlspecialchars(ucfirst($file['document_type'])) ?></p>
-                                    <p class="file-date"><?= date('M d, Y', strtotime($file['upload_date'])) ?></p>
-                                    <span class="hard-copy-indicator"><?= $file['hard_copy_available'] ? '<i class="fas fa-print"></i> Hard Copy' : '' ?></span>
-                                    <button class="view-file-button" onclick="viewFile(<?= htmlspecialchars($file['id']) ?>)">View</button>
+                                    <i class="<?= getFileIcon($file['File_name']) ?> file-icon"></i>
+                                    <p class="file-name"><?= htmlspecialchars($file['File_name']) ?></p>
+                                    <p class="file-type"><?= htmlspecialchars(ucfirst($file['document_type'] ?? 'Unknown')) ?></p>
+                                    <p class="file-date"><?= date('M d, Y', strtotime($file['Upload_date'])) ?></p>
+                                    <span class="hard-copy-indicator"><?= $file['Copy_type'] === 'hard' ? '<i class="fas fa-print"></i> Hard Copy' : '' ?></span>
+                                    <button class="view-file-button" onclick="viewFile(<?= htmlspecialchars($file['File_id']) ?>)">View</button>
                                 </div>
                             <?php endforeach; ?>
                         <?php else: ?>
@@ -366,56 +431,49 @@ function getFileIcon($fileName)
 
                 <?php foreach ($userDepartments as $dept): ?>
                     <div class="file-subsection">
-                        <h3><?= htmlspecialchars($dept['department_name']) ?> Documents</h3>
+                        <h3><?= htmlspecialchars($dept['Department_name']) ?> Documents</h3>
                         <div class="file-controls">
                             <div class="sort-controls">
                                 <label>Sort by Name:</label>
-                                <select class="sort-department-name" data-dept-id="<?= $dept['department_id'] ?>" onchange="sortDepartmentFiles(<?= $dept['department_id'] ?>)">
+                                <select class="sort-department-name" data-dept-id="<?= htmlspecialchars($dept['Department_id']) ?>"
+                                    onchange="sortDepartmentFiles(<?= htmlspecialchars($dept['Department_id']) ?>)">
                                     <option value="">Select</option>
                                     <option value="name-asc">A-Z</option>
                                     <option value="name-desc">Z-A</option>
                                 </select>
                                 <label>Sort by Document Type:</label>
-                                <select class="sort-department-type" data-dept-id="<?= $dept['department_id'] ?>" onchange="sortDepartmentFiles(<?= $dept['department_id'] ?>)">
+                                <select class="sort-department-type" data-dept-id="<?= htmlspecialchars($dept['Department_id']) ?>"
+                                    onchange="sortDepartmentFiles(<?= htmlspecialchars($dept['Department_id']) ?>)">
                                     <option value="">Select</option>
                                     <?php foreach ($docTypes as $type): ?>
-                                        <option value="type-<?= htmlspecialchars($type['name']) ?>"><?= htmlspecialchars(ucfirst($type['name'])) ?></option>
+                                        <option value="type-<?= htmlspecialchars($type['name']) ?>">
+                                            <?= htmlspecialchars(ucfirst($type['name'])) ?>
+                                        </option>
                                     <?php endforeach; ?>
-                                </select>
-                                <label>Sort by Scope:</label>
-                                <select class="sort-department-scope" data-dept-id="<?= $dept['department_id'] ?>" onchange="sortDepartmentFiles(<?= $dept['department_id'] ?>)">
-                                    <option value="">Select</option>
-                                    <option value="department">Department-Wide Files</option>
-                                    <?php if ($dept['sub_department_id']): ?>
-                                        <option value="sub-department"><?= htmlspecialchars($dept['sub_department_name']) ?> Files</option>
-                                    <?php endif; ?>
                                 </select>
                             </div>
                             <div class="filter-controls">
-                                <label><input type="checkbox" class="hard-copy-department-filter" data-dept-id="<?= $dept['department_id'] ?>" onchange="filterDepartmentFilesByHardCopy(<?= $dept['department_id'] ?>)"> Hard Copy Only</label>
+                                <label><input type="checkbox" class="hard-copy-department-filter"
+                                        data-dept-id="<?= htmlspecialchars($dept['Department_id']) ?>"
+                                        onchange="filterDepartmentFilesByHardCopy(<?= htmlspecialchars($dept['Department_id']) ?>)"> Hard Copy Only</label>
                             </div>
                         </div>
-                        <div class="file-grid department-files-grid" id="departmentFiles-<?= $dept['department_id'] ?>">
-                            <?php
-                            $deptFiles = array_merge(
-                                $departmentFiles[$dept['department_id']]['department'] ?? [],
-                                $departmentFiles[$dept['department_id']]['sub_department'] ?? []
-                            );
-                            if (!empty($deptFiles)): ?>
-                                <?php foreach ($deptFiles as $file): ?>
+                        <div class="file-grid department-files-grid" id="departmentFiles-<?= htmlspecialchars($dept['Department_id']) ?>">
+                            <?php if (!empty($departmentFiles[$dept['Department_id']])): ?>
+                                <?php foreach ($departmentFiles[$dept['Department_id']] as $file): ?>
                                     <div class="file-item"
-                                        data-file-id="<?= htmlspecialchars($file['id']) ?>"
-                                        data-file-name="<?= htmlspecialchars($file['file_name']) ?>"
-                                        data-document-type="<?= htmlspecialchars($file['document_type']) ?>"
-                                        data-upload-date="<?= $file['upload_date'] ?>"
-                                        data-hard-copy="<?= $file['hard_copy_available'] ?>"
-                                        data-source="<?= in_array($file, $departmentFiles[$dept['department_id']]['department'] ?? []) ? 'department' : 'sub-department' ?>">
-                                        <i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i>
-                                        <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                                        <p class="file-type"><?= htmlspecialchars(ucfirst($file['document_type'])) ?></p>
-                                        <p class="file-date"><?= date('M d, Y', strtotime($file['upload_date'])) ?></p>
-                                        <span class="hard-copy-indicator"><?= $file['hard_copy_available'] ? '<i class="fas fa-print"></i> Hard Copy' : '' ?></span>
-                                        <button class="view-file-button" onclick="viewFile(<?= htmlspecialchars($file['id']) ?>)">View</button>
+                                        data-file-id="<?= htmlspecialchars($file['File_id']) ?>"
+                                        data-file-name="<?= htmlspecialchars($file['File_name']) ?>"
+                                        data-document-type="<?= htmlspecialchars($file['document_type'] ?? 'Unknown') ?>"
+                                        data-upload-date="<?= htmlspecialchars($file['Upload_date']) ?>"
+                                        data-hard-copy="<?= htmlspecialchars($file['Copy_type'] === 'hard' ? '1' : '0') ?>"
+                                        data-source="department">
+                                        <i class="<?= getFileIcon($file['File_name']) ?> file-icon"></i>
+                                        <p class="file-name"><?= htmlspecialchars($file['File_name']) ?></p>
+                                        <p class="file-type"><?= htmlspecialchars(ucfirst($file['document_type'] ?? 'Unknown')) ?></p>
+                                        <p class="file-date"><?= date('M d, Y', strtotime($file['Upload_date'])) ?></p>
+                                        <span class="hard-copy-indicator"><?= $file['Copy_type'] === 'hard' ? '<i class="fas fa-print"></i> Hard Copy' : '' ?></span>
+                                        <button class="view-file-button" onclick="viewFile(<?= htmlspecialchars($file['File_id']) ?>)">View</button>
                                     </div>
                                 <?php endforeach; ?>
                             <?php else: ?>
@@ -427,7 +485,7 @@ function getFileIcon($fileName)
             </div>
         </div>
 
-        <!-- Existing Popups -->
+        <!-- Popups -->
         <div class="popup-file-selection" id="fileSelectionPopup">
             <button class="exit-button" onclick="closePopup('fileSelectionPopup')" aria-label="Close Popup">×</button>
             <h3>Select a Document</h3>
@@ -445,12 +503,13 @@ function getFileIcon($fileName)
                 <button id="listViewButton" onclick="switchView('list')"><i class="fas fa-list"></i> List</button>
             </div>
             <div id="fileDisplay" class="thumbnail-view masonry-grid">
-                <?php foreach ($files as $file): ?>
-                    <div class="file-item" data-file-id="<?= htmlspecialchars($file['id']) ?>"
-                        data-file-name="<?= htmlspecialchars($file['file_name']) ?>"
-                        data-document-type="<?= htmlspecialchars($file['document_type']) ?>">
-                        <div class="file-icon"><i class="<?= getFileIcon($file['file_name']) ?>"></i></div>
-                        <p><?= htmlspecialchars($file['file_name']) ?></p>
+                <?php foreach ($filesUploaded as $file): ?>
+                    <div class="file-item"
+                        data-file-id="<?= htmlspecialchars($file['File_id']) ?>"
+                        data-file-name="<?= htmlspecialchars($file['File_name']) ?>"
+                        data-document-type="<?= htmlspecialchars($file['document_type'] ?? 'Unknown') ?>">
+                        <div class="file-icon"><i class="<?= getFileIcon($file['File_name']) ?>"></i></div>
+                        <p><?= htmlspecialchars($file['File_name']) ?></p>
                         <button class="select-file-button">Select</button>
                     </div>
                 <?php endforeach; ?>
@@ -467,19 +526,10 @@ function getFileIcon($fileName)
                 <select id="departmentId" name="department_id">
                     <option value="">No Department</option>
                     <?php foreach ($userDepartments as $dept): ?>
-                        <option value="<?= htmlspecialchars($dept['department_id']) ?>" <?= $dept['department_id'] == $user['department_id'] ? 'selected' : '' ?>>
-                            <?= htmlspecialchars($dept['department_name']) ?>
+                        <option value="<?= htmlspecialchars($dept['Department_id']) ?>" <?= $dept['Department_id'] == $user['Department_id'] ? 'selected' : '' ?>>
+                            <?= htmlspecialchars($dept['Department_name']) ?>
                         </option>
                     <?php endforeach; ?>
-                </select>
-                <label for="subDepartmentId">Sub-Department (Optional):</label>
-                <select id="subDepartmentId" name="sub_department_id">
-                    <option value="">No Sub-Department</option>
-                    <?php if (!empty($user['sub_department_id'])): ?>
-                        <option value="<?= htmlspecialchars($user['sub_department_id']) ?>" selected>
-                            <?= htmlspecialchars($user['sub_department_name']) ?>
-                        </option>
-                    <?php endif; ?>
                 </select>
                 <label for="documentType">Document Type:</label>
                 <select id="documentType" name="document_type" required>
@@ -488,7 +538,37 @@ function getFileIcon($fileName)
                         <option value="<?= htmlspecialchars($type['name']) ?>"><?= htmlspecialchars(ucfirst($type['name'])) ?></option>
                     <?php endforeach; ?>
                 </select>
+                <label for="cabinet">Cabinet:</label>
+                <input type="text" id="cabinet" name="cabinet">
                 <div id="dynamicFields"></div>
+                <div class="hardcopy-options">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="hardcopyCheckbox" name="hard_copy_available">
+                        <span class="checkmark"></span>
+                        This file has a hardcopy
+                    </label>
+                    <div class="radio-group" id="hardcopyOptions" style="display: none;">
+                        <label class="radio-container">
+                            <input type="radio" name="hardcopyOption" value="link" checked>
+                            <span class="radio-checkmark"></span>
+                            Link to existing hardcopy
+                        </label>
+                        <label class="radio-container">
+                            <input type="radio" name="hardcopyOption" value="new">
+                            <span class="radio-checkmark"></span>
+                            Suggest new storage location
+                        </label>
+                        <div class="storage-suggestion" id="storageSuggestion"></div>
+                    </div>
+                    <div class="hardcopy-details" id="hardcopyDetails" style="display: none;">
+                        <label for="layer">Layer:</label>
+                        <input type="number" id="layer" name="layer" min="0">
+                        <label for="box">Box:</label>
+                        <input type="number" id="box" name="box" min="0">
+                        <label for="folder">Folder:</label>
+                        <input type="number" id="folder" name="folder" min="0">
+                    </div>
+                </div>
                 <div class="button-group">
                     <button type="button" class="btn-back" onclick="closePopup('fileDetailsPopup')">Cancel</button>
                     <button type="button" class="btn-next" onclick="proceedToHardcopy()">Next</button>
@@ -505,20 +585,24 @@ function getFileIcon($fileName)
                 <select id="recipientSelect" name="recipients[]" multiple style="width: 100%;">
                     <optgroup label="Users">
                         <?php
-                        $stmt = $pdo->prepare("SELECT id, username FROM users WHERE id != ?");
+                        $stmt = $pdo->prepare("SELECT User_id, Username FROM users WHERE User_id != ?");
                         $stmt->execute([$userId]);
                         $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         foreach ($users as $userOption): ?>
-                            <option value="user:<?= htmlspecialchars($userOption['id']) ?>"><?= htmlspecialchars($userOption['username']) ?></option>
+                            <option value="user:<?= htmlspecialchars($userOption['User_id']) ?>">
+                                <?= htmlspecialchars($userOption['Username']) ?>
+                            </option>
                         <?php endforeach; ?>
                     </optgroup>
                     <optgroup label="Departments">
                         <?php
-                        $stmt = $pdo->prepare("SELECT id, name FROM departments");
+                        $stmt = $pdo->prepare("SELECT Department_id, Department_name FROM departments");
                         $stmt->execute();
                         $departments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         foreach ($departments as $dept): ?>
-                            <option value="department:<?= htmlspecialchars($dept['id']) ?>"><?= htmlspecialchars($dept['name']) ?></option>
+                            <option value="department:<?= htmlspecialchars($dept['Department_id']) ?>">
+                                <?= htmlspecialchars($dept['Department_name']) ?>
+                            </option>
                         <?php endforeach; ?>
                     </optgroup>
                 </select>
@@ -532,7 +616,7 @@ function getFileIcon($fileName)
         <div class="popup-questionnaire" id="hardcopyStoragePopup">
             <button class="exit-button" onclick="closePopup('hardcopyStoragePopup')" aria-label="Close Popup">×</button>
             <h3>Hardcopy Storage</h3>
-            <p class="subtitle">Specify if this document has a physical copy and how to manage it.</p>
+            <p class="subtitle">Specify how to manage the physical copy.</p>
             <div class="hardcopy-options">
                 <label class="checkbox-container">
                     <input type="checkbox" id="hardcopyCheckbox" name="hard_copy_available">
@@ -551,6 +635,14 @@ function getFileIcon($fileName)
                         Suggest new storage location
                     </label>
                     <div class="storage-suggestion" id="storageSuggestion"></div>
+                </div>
+                <div class="hardcopy-details" id="hardcopyDetails" style="display: none;">
+                    <label for="layer">Layer:</label>
+                    <input type="number" id="layer" name="layer" min="0">
+                    <label for="box">Box:</label>
+                    <input type="number" id="box" name="box" min="0">
+                    <label for="folder">Folder:</label>
+                    <input type="number" id="folder" name="folder" min="0">
                 </div>
             </div>
             <div class="button-group">
@@ -588,22 +680,24 @@ function getFileIcon($fileName)
             <h3>Request Status</h3>
             <p id="alreadyProcessedMessage"></p>
         </div>
-    </div>
 
-    <div class="activity-log" id="activityLog" style="display: none;">
-        <h3>Activity Log</h3>
-        <div class="log-entries">
-            <?php if (!empty($activityLogs)): ?>
-                <?php foreach ($activityLogs as $log): ?>
-                    <div class="log-entry"><i class="fas fa-history"></i>
-                        <p><?= htmlspecialchars($log['action']) ?></p><span><?= date('h:i A', strtotime($log['timestamp'])) ?></span>
+        <div class="activity-log" id="activityLog" style="display: none;">
+            <h3>Activity Log</h3>
+            <div class="log-entries">
+                <?php if (!empty($activityLogs)): ?>
+                    <?php foreach ($activityLogs as $log): ?>
+                        <div class="log-entry">
+                            <i class="fas fa-history"></i>
+                            <p><?= htmlspecialchars($log['action']) ?></p>
+                            <span><?= date('h:i A', strtotime($log['timestamp'])) ?></span>
+                        </div>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <div class="log-entry">
+                        <p>No recent activity.</p>
                     </div>
-                <?php endforeach; ?>
-            <?php else: ?>
-                <div class="log-entry">
-                    <p>No recent activity.</p>
-                </div>
-            <?php endif; ?>
+                <?php endif; ?>
+            </div>
         </div>
     </div>
 
@@ -616,24 +710,22 @@ function getFileIcon($fileName)
             $('#recipientSelect').select2({
                 placeholder: "Select users or departments",
                 allowClear: true,
-                dropdownCssClass: 'select2-high-zindex' // Custom class for styling
+                dropdownCssClass: 'select2-high-zindex'
             });
 
             $('.toggle-btn').on('click', function() {
                 $('.sidebar').toggleClass('minimized');
-                $('.top-nav').toggleClass('resized', $('.sidebar').hasClass('minimized'));
-                $('.main-content').toggleClass('resized', $('.sidebar').hasClass('minimized'));
+                $('.top-nav, .main-content').toggleClass('resized', $('.sidebar').hasClass('minimized'));
             });
 
             function updateDateTime() {
                 const now = new Date();
-                const options = {
+                $('#currentDate').text(now.toLocaleDateString('en-US', {
                     weekday: 'long',
                     year: 'numeric',
                     month: 'long',
                     day: 'numeric'
-                };
-                $('#currentDate').text(now.toLocaleDateString('en-US', options));
+                }));
                 $('#currentTime').text(now.toLocaleTimeString('en-US'));
             }
             setInterval(updateDateTime, 1000);
@@ -650,7 +742,7 @@ function getFileIcon($fileName)
                 fileInput.on('change', function() {
                     const file = this.files[0];
                     if (file) {
-                        if (file.size > 10 * 1024 * 1024) { // 10MB limit
+                        if (file.size > 10 * 1024 * 1024) {
                             notyf.error('File size exceeds 10MB.');
                             return;
                         }
@@ -659,6 +751,25 @@ function getFileIcon($fileName)
                     }
                     fileInput.remove();
                 });
+            });
+
+            $('#hardcopyCheckbox').on('change', function() {
+                $('#hardcopyOptions, #hardcopyDetails').toggle(this.checked);
+                if (!this.checked) {
+                    $('#storageSuggestion').hide().empty();
+                } else if ($('input[name="hardcopyOption"]:checked').val() === 'new') {
+                    fetchStorageSuggestion();
+                }
+            });
+
+            $('input[name="hardcopyOption"]').on('change', function() {
+                if (this.value === 'new') {
+                    $('#hardcopyDetails').show();
+                    fetchStorageSuggestion();
+                } else {
+                    $('#hardcopyDetails').hide();
+                    $('#storageSuggestion').hide().empty();
+                }
             });
 
             $("#searchInput").autocomplete({
@@ -671,7 +782,11 @@ function getFileIcon($fileName)
                             csrf_token: '<?= htmlspecialchars($_SESSION['csrf_token']) ?>'
                         },
                         success: function(data) {
-                            response(data);
+                            if (data.success) {
+                                response(data.results);
+                            } else {
+                                notyf.error(data.message);
+                            }
                         },
                         error: function() {
                             notyf.error('Error fetching autocomplete suggestions.');
@@ -685,84 +800,6 @@ function getFileIcon($fileName)
                     if (ui.item.department_id) $("#folder").val("department-" + ui.item.department_id);
                     $("#search-form").submit();
                 }
-            });
-
-            fetchNotifications();
-            setInterval(fetchNotifications, 5000);
-            setInterval(fetchAccessNotifications, 5000);
-
-            $('#hardcopyCheckbox').on('change', function() {
-                $('#hardcopyOptions').toggle(this.checked);
-                if (!this.checked) {
-                    $('#storageSuggestion').hide().empty();
-                } else if ($('input[name="hardcopyOption"]:checked').val() === 'new') {
-                    fetchStorageSuggestion();
-                }
-            });
-
-            $('input[name="hardcopyOption"]').on('change', function() {
-                if (this.value === 'new') {
-                    fetchStorageSuggestion();
-                } else {
-                    $('#storageSuggestion').hide().empty();
-                }
-            });
-
-            function loadSubDepartments(departmentId, selectedSubDeptId = null) {
-                const subDeptSelect = $('#subDepartmentId');
-                subDeptSelect.empty().append('<option value="">No Sub-Department</option>');
-
-                if (!departmentId) {
-                    notyf.error('No department selected.');
-                    return;
-                }
-
-                $.ajax({
-                    url: 'get_sub_departments.php',
-                    method: 'POST',
-                    data: {
-                        department_id: departmentId,
-                        csrf_token: '<?= htmlspecialchars($_SESSION['csrf_token']) ?>'
-                    },
-                    dataType: 'json',
-                    beforeSend: function() {
-                        subDeptSelect.prop('disabled', true).append('<option value="">Loading...</option>');
-                    },
-                    success: function(data) {
-                        subDeptSelect.prop('disabled', false).find('option[value=""]').remove(); // Remove "Loading..." option
-                        if (data.success && Array.isArray(data.sub_departments) && data.sub_departments.length > 0) {
-                            data.sub_departments.forEach(subDept => {
-                                const isSelected = subDept.id == selectedSubDeptId ? 'selected' : '';
-                                subDeptSelect.append(`<option value="${subDept.id}" ${isSelected}>${subDept.name}</option>`);
-                            });
-                        } else {
-                            notyf.error(data.message || 'No sub-departments found for this department.');
-                        }
-                    },
-                    error: function(jqXHR, textStatus, errorThrown) {
-                        subDeptSelect.prop('disabled', false).find('option[value=""]').remove(); // Remove "Loading..." option
-                        console.error('AJAX Error:', {
-                            status: jqXHR.status,
-                            statusText: textStatus,
-                            errorThrown: errorThrown,
-                            responseText: jqXHR.responseText
-                        });
-                        notyf.error('Failed to load sub-departments. Check console for details.');
-                    }
-                });
-            }
-
-            // Load sub-departments on page load if a department is pre-selected
-            const initialDeptId = $('#departmentId').val();
-            const initialSubDeptId = <?= json_encode($user['sub_department_id'] ?? null) ?>;
-            if (initialDeptId) {
-                loadSubDepartments(initialDeptId, initialSubDeptId);
-            }
-
-            // Reload sub-departments when department changes
-            $('#departmentId').on('change', function() {
-                const departmentId = $(this).val();
-                loadSubDepartments(departmentId);
             });
 
             $('#documentType').on('change', function() {
@@ -780,8 +817,8 @@ function getFileIcon($fileName)
                         },
                         dataType: 'json',
                         success: function(data) {
-                            if (data.success && Array.isArray(data.fields) && data.fields.length > 0) {
-                                data.fields.forEach(field => {
+                            if (data.success && Array.isArray(data.data.fields) && data.data.fields.length > 0) {
+                                data.data.fields.forEach(field => {
                                     const requiredAttr = field.is_required ? 'required' : '';
                                     let inputField = '';
                                     switch (field.field_type) {
@@ -796,25 +833,19 @@ function getFileIcon($fileName)
                                             break;
                                     }
                                     dynamicFields.append(`
-                            <label for="${field.field_name}">${field.field_label}${field.is_required ? ' *' : ''}:</label>
-                            ${inputField}
-                        `);
+                                        <label for="${field.field_name}">${field.field_label}${field.is_required ? ' *' : ''}:</label>
+                                        ${inputField}
+                                    `);
                                 });
-                            } else if (data.success && data.fields.length === 0) {
-                                dynamicFields.append('<p>No metadata fields defined for this document type. Contact an administrator to add fields.</p>');
                             } else {
-                                dynamicFields.append(`<p>Error: ${data.message || 'Failed to load metadata fields.'}</p>`);
-                                notyf.error(data.message || 'Failed to load metadata fields.');
+                                dynamicFields.append(`<p>${data.message || 'No metadata fields defined for this document type.'}</p>`);
                             }
                         },
                         error: function(jqXHR, textStatus, errorThrown) {
                             console.error('AJAX error:', textStatus, errorThrown, jqXHR.responseText);
-                            dynamicFields.append('<p>Error: Failed to load metadata fields. Please try again or contact support.</p>');
-                            notyf.error('Failed to load metadata fields. Check console for details.');
+                            notyf.error('Failed to load metadata fields.');
                         }
                     });
-                } else {
-                    dynamicFields.append('<p>Please select a document type.</p>');
                 }
             });
 
@@ -822,11 +853,31 @@ function getFileIcon($fileName)
                 $('.file-item').removeClass('selected');
                 const $fileItem = $(this).closest('.file-item');
                 $fileItem.addClass('selected');
-                const fileId = $fileItem.data('file-id');
-                $('#sendFilePopup').data('selected-file-id', fileId);
+                $('#sendFilePopup').data('selected-file-id', $fileItem.data('file-id'));
                 $('#fileSelectionPopup').hide();
                 $('#sendFilePopup').show();
             });
+
+            $(document).on('click', '.notification-item', function() {
+                const status = $(this).data('status');
+                const fileId = $(this).data('file-id');
+                const notificationId = $(this).data('notification-id');
+                const message = $(this).data('message');
+
+                if (status !== 'pending') {
+                    $('#alreadyProcessedMessage').text('This request has already been processed.');
+                    $('#alreadyProcessedPopup').show();
+                    return;
+                }
+
+                $('#fileAcceptanceTitle').text('Review File');
+                $('#fileAcceptanceMessage').text(message);
+                $('#fileAcceptancePopup').data('notification-id', notificationId).data('file-id', fileId).show();
+                showFilePreview(fileId);
+            });
+
+            fetchNotifications();
+            setInterval(fetchNotifications, 5000);
         });
 
         function fetchNotifications() {
@@ -839,33 +890,30 @@ function getFileIcon($fileName)
                 dataType: 'json',
                 success: function(data) {
                     const notificationContainer = $('.notification-log .log-entries');
-                    if (Array.isArray(data) && data.length > 0) {
-                        const currentNotifications = notificationContainer.find('.notification-item').map(function() {
+                    if (data.success && Array.isArray(data.notifications) && data.notifications.length > 0) {
+                        const currentIds = notificationContainer.find('.notification-item').map(function() {
                             return $(this).data('notification-id');
                         }).get();
-                        const newNotifications = data.map(n => n.id);
+                        const newIds = data.notifications.map(n => n.id);
 
-                        if (JSON.stringify(currentNotifications) !== JSON.stringify(newNotifications)) {
+                        if (JSON.stringify(currentIds) !== JSON.stringify(newIds)) {
                             notificationContainer.empty();
-                            data.forEach(notification => {
-                                const notificationClass = notification.type === 'access_request' && notification.status === 'pending' ?
-                                    'pending-access' :
-                                    (notification.type === 'received' && notification.status === 'pending' ? 'received-pending' : 'processed-access');
+                            data.notifications.forEach(n => {
+                                const notificationClass = n.status === 'pending' ? 'pending-access' : 'processed-access';
                                 notificationContainer.append(`
-                            <div class="log-entry notification-item ${notificationClass}"
-                                data-notification-id="${notification.id}"
-                                data-file-id="${notification.file_id}"
-                                data-message="${notification.message}"
-                                data-type="${notification.type}"
-                                data-status="${notification.status}">
-                                <i class="fas fa-bell"></i>
-                                <p>${notification.message}</p>
-                                <span>${new Date(notification.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
-                            </div>
-                        `);
+                                    <div class="log-entry notification-item ${notificationClass}"
+                                         data-notification-id="${n.id}"
+                                         data-file-id="${n.file_id || ''}"
+                                         data-message="${n.message}"
+                                         data-status="${n.status}">
+                                        <i class="fas fa-bell"></i>
+                                        <p>${n.message}</p>
+                                        <span>${new Date(n.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
+                                    </div>
+                                `);
                             });
                         }
-                    } else if (Array.isArray(data) && data.length === 0 && notificationContainer.find('.notification-item').length === 0) {
+                    } else {
                         notificationContainer.empty().append('<div class="log-entry"><p>No new notifications.</p></div>');
                     }
                 },
@@ -875,35 +923,11 @@ function getFileIcon($fileName)
             });
         }
 
-        function fetchAccessNotifications() {
-            // Placeholder for fetching access notifications
-        }
-
-        $(document).on('click', '.notification-item', function() {
-            const type = $(this).data('type');
-            const status = $(this).data('status');
-            const fileId = $(this).data('file-id');
-            const notificationId = $(this).data('notification-id');
-            const message = $(this).data('message');
-
-            if (status !== 'pending') {
-                $('#alreadyProcessedMessage').text('This request has already been processed.');
-                $('#alreadyProcessedPopup').show();
+        function showFilePreview(fileId) {
+            if (!fileId) {
+                $('#filePreview').html('<p>No file selected.</p>');
                 return;
             }
-
-            if (type === 'received' || type === 'access_request') {
-                $('#fileAcceptanceTitle').text('Review ' + (type === 'received' ? 'Received File' : 'Access Request'));
-                $('#fileAcceptanceMessage').text(message);
-                $('#fileAcceptancePopup').data('notification-id', notificationId).data('file-id', fileId).show();
-                showFilePreview(fileId);
-            } else {
-                $('#alreadyProcessedMessage').text('This request has already been processed.');
-                $('#alreadyProcessedPopup').show();
-            }
-        });
-
-        function showFilePreview(fileId) {
             $.ajax({
                 url: 'get_file_preview.php',
                 method: 'GET',
@@ -919,19 +943,11 @@ function getFileIcon($fileName)
             });
         }
 
-        $('#acceptFileButton').on('click', function() {
-            const notificationId = $('#fileAcceptancePopup').data('notification-id');
-            const fileId = $('#fileAcceptancePopup').data('file-id');
-            handleFileAction(notificationId, fileId, 'accept');
-        });
-
-        $('#denyFileButton').on('click', function() {
-            const notificationId = $('#fileAcceptancePopup').data('notification-id');
-            const fileId = $('#fileAcceptancePopup').data('file-id');
-            handleFileAction(notificationId, fileId, 'deny');
-        });
-
         function handleFileAction(notificationId, fileId, action) {
+            if (!notificationId || !fileId) {
+                notyf.error('Invalid notification or file ID.');
+                return;
+            }
             $.ajax({
                 url: 'handle_file_acceptance.php',
                 method: 'POST',
@@ -946,11 +962,13 @@ function getFileIcon($fileName)
                     if (response.success) {
                         notyf.success(response.message);
                         $('#fileAcceptancePopup').hide();
-                        $('.notification-item[data-notification-id="' + notificationId + '"]').removeClass('pending-access received-pending')
+                        $('.notification-item[data-notification-id="' + notificationId + '"]')
+                            .removeClass('pending-access')
                             .addClass('processed-access')
                             .off('click')
                             .find('p').text(response.message + ' (Processed)');
                         fetchNotifications();
+                        if (response.redirect) window.location.href = response.redirect;
                     } else {
                         notyf.error(response.message);
                     }
@@ -967,8 +985,21 @@ function getFileIcon($fileName)
                 $('.file-item').removeClass('selected');
                 $('#sendFilePopup').removeData('selected-file-id');
             }
-            if (popupId === 'fileDetailsPopup') selectedFile = null;
-            if (popupId === 'hardcopyStoragePopup') $('#storageSuggestion').empty();
+            if (popupId === 'fileDetailsPopup') {
+                selectedFile = null;
+                $('#dynamicFields').empty();
+                $('#hardcopyDetails').hide();
+                $('#hardcopyCheckbox').prop('checked', false);
+            }
+            if (popupId === 'hardcopyStoragePopup') {
+                $('#storageSuggestion').empty();
+                $('#hardcopyDetails').hide();
+            }
+            if (popupId === 'linkHardcopyPopup') {
+                selectedHardcopyId = null;
+                $('#hardcopyList').empty();
+                $('#linkHardcopyButton').prop('disabled', true);
+            }
         }
 
         function toggleActivityLog() {
@@ -987,15 +1018,10 @@ function getFileIcon($fileName)
                 notyf.error('Please select a document type.');
                 return;
             }
-            const departmentId = $('#departmentId').val();
             $('#fileDetailsPopup').hide();
-            if (departmentId) {
-                $('#hardcopyStoragePopup').show();
-                if ($('#hardcopyCheckbox').is(':checked') && $('input[name="hardcopyOption"]:checked').val() === 'new') {
-                    fetchStorageSuggestion();
-                }
-            } else {
-                uploadFile();
+            $('#hardcopyStoragePopup').show();
+            if ($('#hardcopyCheckbox').is(':checked') && $('input[name="hardcopyOption"]:checked').val() === 'new') {
+                fetchStorageSuggestion();
             }
         }
 
@@ -1016,28 +1042,41 @@ function getFileIcon($fileName)
         }
 
         function fetchHardcopyFiles() {
+            const departmentId = $('#departmentId').val();
+            if (!departmentId) {
+                notyf.error('Please select a department.');
+                return;
+            }
             $.ajax({
                 url: 'fetch_hardcopy_files.php',
                 method: 'POST',
                 data: {
+                    department_id: departmentId,
                     csrf_token: '<?= htmlspecialchars($_SESSION['csrf_token']) ?>'
                 },
                 dataType: 'json',
                 success: function(data) {
                     const hardcopyList = $('#hardcopyList');
                     hardcopyList.empty();
-                    data.forEach(file => {
-                        hardcopyList.append(`
-                    <div class="file-item" data-file-id="${file.id}">
-                        <input type="radio" name="hardcopyFile" value="${file.id}">
-                        <span>${file.file_name}</span>
-                    </div>
-                `);
-                    });
-                    hardcopyList.find('input').on('change', function() {
-                        selectedHardcopyId = $(this).val();
-                        $('#linkHardcopyButton').prop('disabled', false);
-                    });
+                    if (data.success && data.files.length > 0) {
+                        data.files.forEach(file => {
+                            const metadata = file.meta_data ? JSON.parse(file.meta_data) : {};
+                            const location = metadata.cabinet ?
+                                `Cabinet: ${metadata.cabinet}, Layer: ${metadata.layer || 'N/A'}, Box: ${metadata.box || 'N/A'}, Folder: ${metadata.folder || 'N/A'}` : 'No location specified';
+                            hardcopyList.append(`
+                                <div class="file-item" data-file-id="${file.id}">
+                                    <input type="radio" name="hardcopyFile" value="${file.id}">
+                                    <span>${file.file_name} (${location})</span>
+                                </div>
+                            `);
+                        });
+                        hardcopyList.find('input').on('change', function() {
+                            selectedHardcopyId = $(this).val();
+                            $('#linkHardcopyButton').prop('disabled', false);
+                        });
+                    } else {
+                        hardcopyList.append('<p>No hardcopy files available.</p>');
+                    }
                 },
                 error: function() {
                     notyf.error('Failed to fetch hardcopy files.');
@@ -1063,7 +1102,6 @@ function getFileIcon($fileName)
 
         function fetchStorageSuggestion() {
             const departmentId = $('#departmentId').val();
-            const subDepartmentId = $('#subDepartmentId').val() || null;
             if (!departmentId) {
                 $('#storageSuggestion').html('<p>No department selected.</p>').show();
                 return;
@@ -1073,15 +1111,18 @@ function getFileIcon($fileName)
                 method: 'POST',
                 data: {
                     department_id: departmentId,
-                    sub_department_id: subDepartmentId,
                     csrf_token: '<?= htmlspecialchars($_SESSION['csrf_token']) ?>'
                 },
                 dataType: 'json',
                 success: function(data) {
                     if (data.success) {
-                        $('#storageSuggestion').html(`<p>Suggested Location: ${data.suggestion}</p><span>Based on department/sub-department selection</span>`).show();
+                        window.storageMetadata = data.metadata;
+                        $('#storageSuggestion').html(`<p>Suggested Location: Cabinet ${data.metadata.cabinet}, Layer ${data.metadata.layer}, Box ${data.metadata.box}, Folder ${data.metadata.folder}</p>`).show();
+                        $('#layer').val(data.metadata.layer);
+                        $('#box').val(data.metadata.box);
+                        $('#folder').val(data.metadata.folder);
                     } else {
-                        $('#storageSuggestion').html(`<p>${data.suggestion || 'No suggestion available'}</p>`).show();
+                        $('#storageSuggestion').html(`<p>${data.message}</p>`).show();
                     }
                 },
                 error: function() {
@@ -1092,11 +1133,10 @@ function getFileIcon($fileName)
 
         function uploadFile() {
             const documentType = $('#documentType').val();
-            const departmentId = $('#departmentId').val() || null;
-            const subDepartmentId = $('#subDepartmentId').val() || null;
-            const hardcopyAvailable = $('#hardcopyCheckbox').is(':checked');
-            const hardcopyOption = hardcopyAvailable ? $('input[name="hardcopyOption"]:checked').val() : null;
-
+            if (!documentType) {
+                notyf.error('Please select a document type.');
+                return;
+            }
             if (!selectedFile) {
                 notyf.error('No file selected.');
                 return;
@@ -1105,24 +1145,22 @@ function getFileIcon($fileName)
             const formData = new FormData();
             formData.append('file', selectedFile);
             formData.append('document_type', documentType);
-            formData.append('user_id', '<?= htmlspecialchars($userId) ?>'); // Ensure user_id is sent
+            formData.append('user_id', '<?= htmlspecialchars($userId) ?>');
             formData.append('csrf_token', '<?= htmlspecialchars($_SESSION['csrf_token']) ?>');
-            if (departmentId) formData.append('department_id', departmentId);
-            if (subDepartmentId) formData.append('sub_department_id', subDepartmentId);
-            formData.append('hard_copy_available', hardcopyAvailable ? 1 : 0);
-            if (hardcopyAvailable && hardcopyOption === 'link' && selectedHardcopyId) {
+            formData.append('hard_copy_available', $('#hardcopyCheckbox').is(':checked') ? 1 : 0);
+            formData.append('cabinet', $('#cabinet').val());
+            if ($('#hardcopyCheckbox').is(':checked') && $('input[name="hardcopyOption"]:checked').val() === 'new') {
+                formData.append('layer', $('#layer').val() || window.storageMetadata?.layer || 0);
+                formData.append('box', $('#box').val() || window.storageMetadata?.box || 0);
+                formData.append('folder', $('#folder').val() || window.storageMetadata?.folder || 0);
+            } else if ($('#hardcopyCheckbox').is(':checked') && $('input[name="hardcopyOption"]:checked').val() === 'link' && selectedHardcopyId) {
                 formData.append('link_hardcopy_id', selectedHardcopyId);
-            } else if (hardcopyAvailable && hardcopyOption === 'new') {
-                formData.append('new_storage', 1);
-                if (window.storageMetadata) {
-                    formData.append('storage_metadata', JSON.stringify(window.storageMetadata));
-                }
             }
 
             $('#fileDetailsForm').find('input, textarea, select').each(function() {
                 const name = $(this).attr('name');
                 const value = $(this).val();
-                if (name && value && name !== 'department_id' && name !== 'document_type' && name !== 'sub_department_id' && name !== 'csrf_token') {
+                if (name && value && !['department_id', 'document_type', 'csrf_token', 'cabinet', 'layer', 'box', 'folder', 'hard_copy_available'].includes(name)) {
                     formData.append(name, value);
                 }
             });
@@ -1148,26 +1186,21 @@ function getFileIcon($fileName)
                     return xhr;
                 },
                 success: function(data) {
-                    try {
-                        const response = typeof data === 'string' ? JSON.parse(data) : data;
-                        if (response.success) {
-                            notyf.success(response.message);
-                            $('#hardcopyStoragePopup').hide();
-                            $('#linkHardcopyPopup').hide();
-                            selectedFile = null;
-                            selectedHardcopyId = null;
-                            window.storageMetadata = null;
-                            window.location.href = response.redirect || 'my-folder.php';
-                        } else {
-                            notyf.error(response.message || 'Failed to upload file.');
-                        }
-                    } catch (e) {
-                        console.error('Error parsing response:', e, data);
-                        notyf.error('Invalid server response.');
+                    const response = typeof data === 'string' ? JSON.parse(data) : data;
+                    if (response.success) {
+                        notyf.success(response.message);
+                        $('#hardcopyStoragePopup').hide();
+                        $('#linkHardcopyPopup').hide();
+                        selectedFile = null;
+                        selectedHardcopyId = null;
+                        window.storageMetadata = null;
+                        window.location.href = 'my-folder.php';
+                    } else {
+                        notyf.error(response.message || 'Failed to upload file.');
                     }
                 },
                 error: function(jqXHR, textStatus, errorThrown) {
-                    console.error("Upload error:", textStatus, errorThrown, jqXHR.responseText);
+                    console.error('Upload error:', textStatus, errorThrown, jqXHR.responseText);
                     notyf.error('An error occurred while uploading the file.');
                 }
             });
@@ -1179,7 +1212,6 @@ function getFileIcon($fileName)
                 notyf.error('Please select at least one recipient.');
                 return;
             }
-
             const fileId = $('.file-item.selected').data('file-id') || $('#sendFilePopup').data('selected-file-id');
             if (!fileId) {
                 notyf.error('No file selected to send.');
@@ -1205,8 +1237,8 @@ function getFileIcon($fileName)
                         notyf.error(response.message || 'Error sending file.');
                     }
                 },
-                error: function(jqXHR, textStatus, errorThrown) {
-                    notyf.error('Error sending file: ' + textStatus);
+                error: function() {
+                    notyf.error('Error sending file.');
                 }
             });
         }
@@ -1216,8 +1248,7 @@ function getFileIcon($fileName)
             $('#fileAcceptancePopup').data('file-id', fileId).show();
             $('#fileAcceptanceTitle').text('View File');
             $('#fileAcceptanceMessage').text('Previewing file.');
-            $('#acceptFileButton').hide();
-            $('#denyFileButton').hide();
+            $('#acceptFileButton, #denyFileButton').hide();
         }
 
         function sortPersonalFiles() {
@@ -1231,34 +1262,22 @@ function getFileIcon($fileName)
                 const aData = $(a).data();
                 const bData = $(b).data();
 
-                // Prioritize sorting by name
                 if (nameSort) {
-                    if (nameSort === 'name-asc') {
-                        return aData.fileName.localeCompare(bData.fileName);
-                    } else if (nameSort === 'name-desc') {
-                        return bData.fileName.localeCompare(aData.fileName);
-                    }
+                    return nameSort === 'name-asc' ?
+                        aData.fileName.localeCompare(bData.fileName) :
+                        bData.fileName.localeCompare(aData.fileName);
                 }
-
-                // Then by document type
                 if (typeSort) {
                     const docType = typeSort.replace('type-', '');
                     if (aData.documentType === docType && bData.documentType !== docType) return -1;
                     if (bData.documentType === docType && aData.documentType !== docType) return 1;
                     return 0;
                 }
-
-                // Then by source
                 if (sourceSort) {
-                    if (sourceSort === 'uploaded') {
-                        return aData.source === 'uploaded' ? -1 : bData.source === 'uploaded' ? 1 : 0;
-                    } else if (sourceSort === 'received') {
-                        return aData.source === 'received' ? -1 : bData.source === 'received' ? 1 : 0;
-                    } else if (sourceSort === 'requested') {
-                        return aData.source === 'requested' ? -1 : bData.source === 'requested' ? 1 : 0;
-                    }
+                    if (sourceSort === aData.source) return -1;
+                    if (sourceSort === bData.source) return 1;
+                    return 0;
                 }
-
                 return 0;
             });
 
@@ -1276,7 +1295,6 @@ function getFileIcon($fileName)
         function sortDepartmentFiles(deptId) {
             const nameSort = $(`.sort-department-name[data-dept-id="${deptId}"]`).val();
             const typeSort = $(`.sort-department-type[data-dept-id="${deptId}"]`).val();
-            const scopeSort = $(`.sort-department-scope[data-dept-id="${deptId}"]`).val();
             const $container = $(`#departmentFiles-${deptId}`);
             const $items = $container.find('.file-item').get();
 
@@ -1284,32 +1302,17 @@ function getFileIcon($fileName)
                 const aData = $(a).data();
                 const bData = $(b).data();
 
-                // Prioritize sorting by name
                 if (nameSort) {
-                    if (nameSort === 'name-asc') {
-                        return aData.fileName.localeCompare(bData.fileName);
-                    } else if (nameSort === 'name-desc') {
-                        return bData.fileName.localeCompare(aData.fileName);
-                    }
+                    return nameSort === 'name-asc' ?
+                        aData.fileName.localeCompare(bData.fileName) :
+                        bData.fileName.localeCompare(aData.fileName);
                 }
-
-                // Then by document type
                 if (typeSort) {
                     const docType = typeSort.replace('type-', '');
                     if (aData.documentType === docType && bData.documentType !== docType) return -1;
                     if (bData.documentType === docType && aData.documentType !== docType) return 1;
                     return 0;
                 }
-
-                // Then by scope
-                if (scopeSort) {
-                    if (scopeSort === 'department') {
-                        return aData.source === 'department' ? -1 : bData.source === 'department' ? 1 : 0;
-                    } else if (scopeSort === 'sub-department') {
-                        return aData.source === 'sub-department' ? -1 : bData.source === 'sub-department' ? 1 : 0;
-                    }
-                }
-
                 return 0;
             });
 
@@ -1324,7 +1327,7 @@ function getFileIcon($fileName)
             });
         }
 
-        window.switchView = function(view) {
+        function switchView(view) {
             const fileDisplay = $('#fileDisplay');
             if (view === 'thumbnail') {
                 fileDisplay.removeClass('list-view').addClass('thumbnail-view masonry-grid');
@@ -1335,7 +1338,7 @@ function getFileIcon($fileName)
                 $('#listViewButton').addClass('active');
                 $('#thumbnailViewButton').removeClass('active');
             }
-        };
+        }
 
         function filterFilesByType() {
             const typeFilter = $('#documentTypeFilter').val().toLowerCase();

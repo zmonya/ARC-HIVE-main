@@ -3,10 +3,59 @@ session_start();
 require_once 'db_connection.php';
 require_once 'log_activity.php';
 require_once 'notification.php';
+require_once 'vendor/autoload.php'; // Load Composer autoloader for phpdotenv
 
-global $pdo;
+use Dotenv\Dotenv;
 
-function getFileIcon($fileName)
+// Load environment variables
+$dotenv = Dotenv::createImmutable(__DIR__);
+$dotenv->load();
+
+// Disable error display in production
+ini_set('display_errors', 0);
+ini_set('display_startup_errors', 0);
+ini_set('error_log', __DIR__ . '/logs/error_log.log');
+error_reporting(E_ALL);
+
+/**
+ * Sends a JSON response with appropriate HTTP status for AJAX requests.
+ *
+ * @param bool $success
+ * @param string $message
+ * @param array $data
+ * @param int $statusCode
+ * @return void
+ */
+function sendJsonResponse(bool $success, string $message, array $data, int $statusCode): void
+{
+    header('Content-Type: application/json; charset=UTF-8');
+    http_response_code($statusCode);
+    echo json_encode(array_merge(['success' => $success, 'message' => $message], $data));
+    exit;
+}
+
+/**
+ * Validates user session.
+ *
+ * @return array User ID and role
+ * @throws Exception If user is not authenticated
+ */
+function validateSession(): array
+{
+    if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
+        throw new Exception('Unauthorized access: Please log in.', 401);
+    }
+    session_regenerate_id(true); // Regenerate session ID for security
+    return ['user_id' => (int)$_SESSION['user_id'], 'role' => $_SESSION['role']];
+}
+
+/**
+ * Gets the appropriate Font Awesome icon class for a file based on its extension.
+ *
+ * @param string $fileName
+ * @return string Icon class
+ */
+function getFileIcon(string $fileName): string
 {
     $iconClasses = [
         'pdf' => 'fas fa-file-pdf',
@@ -26,100 +75,142 @@ function getFileIcon($fileName)
     return $iconClasses[$extension] ?? $iconClasses['default'];
 }
 
-if (!isset($_SESSION['user_id'])) {
-    header('Location: login.php');
-    exit();
+/**
+ * Fetches user departments.
+ *
+ * @param PDO $pdo
+ * @param int $userId
+ * @return array
+ */
+function fetchUserDepartments(PDO $pdo, int $userId): array
+{
+    $stmt = $pdo->prepare("
+        SELECT d.Department_id AS id, d.Department_name AS name
+        FROM departments d
+        JOIN users_department ud ON d.Department_id = ud.Department_id
+        WHERE ud.User_id = ?
+        ORDER BY d.Department_name
+    ");
+    $stmt->execute([$userId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
-$userId = $_SESSION['user_id'];
-$userRole = $_SESSION['role'];
+/**
+ * Fetches document types from documents_type_fields.
+ *
+ * @param PDO $pdo
+ * @return array
+ */
+function fetchDocumentTypes(PDO $pdo): array
+{
+    $stmt = $pdo->prepare("SELECT DISTINCT Field_name AS name FROM documents_type_fields ORDER BY Field_name");
+    $stmt->execute();
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
 
-$stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
-$stmt->execute([$userId]);
-$user = $stmt->fetch(PDO::FETCH_ASSOC);
-if (!$user) die("User not found.");
-
-$stmt = $pdo->prepare("
-    SELECT d.id, d.name 
-    FROM departments d 
-    JOIN user_department_affiliations uda ON d.id = uda.department_id 
-    WHERE uda.user_id = ?
-");
-$stmt->execute([$userId]);
-$userDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Fetch all document types dynamically
-$stmt = $pdo->prepare("SELECT id, name FROM document_types");
-$stmt->execute();
-$documentTypes = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-// Fetch all files (uploaded and received)
-$stmt = $pdo->prepare("
-    SELECT DISTINCT f.*, dt.name AS document_type, u.full_name AS uploader_name,
-           sd.name AS sub_department_name, sd.id AS sub_department_id,
-           c.cabinet_name, sl.layer, sl.box, sl.folder
-    FROM files f 
-    LEFT JOIN document_types dt ON f.document_type_id = dt.id 
-    LEFT JOIN users u ON f.user_id = u.id
-    LEFT JOIN file_storage fs ON f.id = fs.file_id
-    LEFT JOIN storage_locations sl ON fs.storage_location_id = sl.id
-    LEFT JOIN cabinets c ON sl.cabinet_id = c.id
-    LEFT JOIN user_department_affiliations uda ON uda.user_id = f.user_id
-    LEFT JOIN sub_departments sd ON sd.id = uda.sub_department_id
-    WHERE f.is_deleted = 0 AND (
-        EXISTS (
-            SELECT 1 FROM file_owners fo 
-            WHERE fo.file_id = f.id AND fo.user_id = ? AND fo.ownership_type = 'original'
-        ) OR EXISTS (
-            SELECT 1 FROM file_transfers ft 
-            WHERE ft.file_id = f.id AND ft.recipient_id = ? AND ft.status = 'accepted'
-        ) OR EXISTS (
-            SELECT 1 FROM file_owners fo 
-            WHERE fo.file_id = f.id AND fo.user_id = ? AND fo.ownership_type = 'co-owner'
-        ) OR EXISTS (
-            SELECT 1 FROM access_requests ar 
-            WHERE ar.file_id = f.id AND ar.requester_id = ? AND ar.status = 'approved'
+/**
+ * Fetches files accessible to the user (uploaded or via transactions).
+ *
+ * @param PDO $pdo
+ * @param int $userId
+ * @return array
+ */
+function fetchUserFiles(PDO $pdo, int $userId): array
+{
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT f.File_id AS id, f.File_name AS file_name, f.User_id AS user_id, f.Upload_date AS upload_date,
+               f.File_size AS file_size, f.File_type AS file_type, f.File_path AS file_path, f.Meta_data AS meta_data,
+               dtf.Field_name AS document_type, u.Username AS uploader_name
+        FROM files f
+        LEFT JOIN documents_type_fields dtf ON f.Document_type_id = dtf.Document_type_id
+        LEFT JOIN users u ON f.User_id = u.User_id
+        WHERE f.File_status != 'deleted' AND (
+            f.User_id = ? OR EXISTS (
+                SELECT 1 FROM transaction t
+                WHERE t.File_id = f.File_id
+                AND t.User_id = ?
+                AND t.Transaction_type IN (2, 4, 5)
+                AND t.Transaction_status = 'accepted'
+            )
         )
-    )
-    ORDER BY f.upload_date DESC
-");
-$stmt->execute([$userId, $userId, $userId, $userId]);
-$files = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        ORDER BY f.Upload_date DESC
+    ");
+    $stmt->execute([$userId, $userId]);
+    $files = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Filter files based on sort and sub-department
-$sortFilter = $_GET['sort'] ?? 'all';
-$subDeptFilter = $_GET['sub_dept'] ?? 'all';
-$filteredFiles = array_filter($files, function ($file) use ($userId, $sortFilter, $subDeptFilter) {
-    $isUploadedByMe = $file['user_id'] == $userId;
-    $isReceived = !$isUploadedByMe;
-    $isHardcopyOnly = $file['hard_copy_available'] == 1 && empty($file['file_path']);
-    $isSoftcopyOnly = $file['hard_copy_available'] == 0 && !empty($file['file_path']);
-    $matchesSubDept = $subDeptFilter === 'all' ||
-        ($subDeptFilter === 'none' && $file['sub_department_id'] === null) ||
-        ($file['sub_department_id'] !== null && $file['sub_department_id'] == $subDeptFilter);
+    // Parse Meta_data JSON
+    foreach ($files as &$file) {
+        $metaData = json_decode($file['meta_data'] ?? '{}', true);
+        $file['hard_copy_available'] = $metaData['hard_copy_available'] ?? 0;
+        $file['cabinet_name'] = $metaData['cabinet_name'] ?? 'N/A';
+        $file['layer'] = $metaData['layer'] ?? 'N/A';
+        $file['box'] = $metaData['box'] ?? 'N/A';
+        $file['folder'] = $metaData['folder'] ?? 'N/A';
+        $file['pages'] = $metaData['pages'] ?? 'N/A';
+        $file['purpose'] = $metaData['purpose'] ?? 'Not specified';
+        $file['subject'] = $metaData['subject'] ?? 'Not specified';
+    }
+    unset($file);
+    return $files;
+}
 
-    return $matchesSubDept && match ($sortFilter) {
-        'uploaded-by-me' => $isUploadedByMe,
-        'received' => $isReceived,
-        'hardcopy' => $isHardcopyOnly,
-        'softcopy' => $isSoftcopyOnly,
-        default => true
-    };
-});
+try {
+    // Validate session
+    $session = validateSession();
+    $userId = $session['user_id'];
+    $userRole = $session['role'];
 
-// Separate uploaded and received files for display
-$uploadedFiles = array_filter($filteredFiles, fn($file) => $file['user_id'] == $userId);
-$receivedFiles = array_filter($filteredFiles, fn($file) => $file['user_id'] != $userId);
+    // Handle CSRF token
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    $csrfToken = $_SESSION['csrf_token'];
 
-// Fetch sub-departments for filter
-$stmt = $pdo->prepare("
-    SELECT sd.id AS sub_department_id, sd.name AS sub_department_name
-    FROM user_department_affiliations uda
-    LEFT JOIN sub_departments sd ON uda.sub_department_id = sd.id
-    WHERE uda.user_id = ?
-");
-$stmt->execute([$userId]);
-$userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    // Validate user
+    global $pdo;
+    $stmt = $pdo->prepare("SELECT Username FROM users WHERE User_id = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user) {
+        throw new Exception('User not found.', 404);
+    }
+
+    // Fetch user departments and document types
+    $userDepartments = fetchUserDepartments($pdo, $userId);
+    $documentTypes = fetchDocumentTypes($pdo);
+
+    // Fetch user files
+    $files = fetchUserFiles($pdo, $userId);
+
+    // Apply filters
+    $sortFilter = filter_input(INPUT_GET, 'sort', FILTER_SANITIZE_STRING, ['options' => ['default' => 'all']]);
+    $validSorts = ['all', 'uploaded-by-me', 'received', 'hardcopy', 'softcopy'];
+    if (!in_array($sortFilter, $validSorts)) {
+        $sortFilter = 'all';
+    }
+
+    $filteredFiles = array_filter($files, function ($file) use ($userId, $sortFilter) {
+        $isUploadedByMe = $file['user_id'] == $userId;
+        $isReceived = !$isUploadedByMe;
+        $isHardcopyOnly = ($file['hard_copy_available'] ?? 0) == 1 && empty($file['file_path']);
+        $isSoftcopyOnly = ($file['hard_copy_available'] ?? 0) == 0 && !empty($file['file_path']);
+        return match ($sortFilter) {
+            'uploaded-by-me' => $isUploadedByMe,
+            'received' => $isReceived,
+            'hardcopy' => $isHardcopyOnly,
+            'softcopy' => $isSoftcopyOnly,
+            default => true
+        };
+    });
+
+    // Separate uploaded and received files
+    $uploadedFiles = array_filter($filteredFiles, fn($file) => $file['user_id'] == $userId);
+    $receivedFiles = array_filter($filteredFiles, fn($file) => $file['user_id'] != $userId);
+} catch (Exception $e) {
+    error_log("Error in my-Folder.php: " . $e->getMessage());
+    http_response_code($e->getCode() ?: 500);
+    die('Error: ' . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8'));
+}
 ?>
 
 <!DOCTYPE html>
@@ -128,46 +219,313 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>My Folder</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta http-equiv="X-Frame-Options" content="DENY">
+    <meta http-equiv="X-XSS-Protection" content="1; mode=block">
+    <title><?= htmlspecialchars($user['Username']) ?>'s Folder - Document Archival</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" integrity="sha512-z3gLpd7yknf1YoNbCzqRKc4qyor8gaKU1qmn+CShxbuBusANI9QpRohGBreCFkKxLhei6S9CQXFEbbKuqLg0DA==" crossorigin="anonymous" referrerpolicy="no-referrer">
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style/client-sidebar.css">
     <link rel="stylesheet" href="style/folder-page.css">
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        .top-nav {
+            display: flex;
+            align-items: center;
+            padding: 10px 20px;
+            background-color: #f4f4f4;
+        }
+
+        .top-nav h2 {
+            margin: 0;
+            flex-grow: 1;
+        }
+
+        .search-bar {
+            padding: 8px;
+            width: 200px;
+            margin-right: 10px;
+        }
+
+        .main-content {
+            padding: 20px;
+            transition: margin-left 0.3s ease;
+        }
+
+        .sorting-buttons {
+            margin-bottom: 15px;
+        }
+
+        .sort-btn {
+            padding: 8px 16px;
+            margin-right: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .sort-btn.active {
+            background-color: #007bff;
+            color: white;
+        }
+
+        .ftypes {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .ftype-card {
+            padding: 10px;
+            background-color: #e0e0e0;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .masonry-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .masonry-section h3 {
+            margin: 0 0 10px;
+        }
+
+        .file-card-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+        }
+
+        .file-card {
+            padding: 10px;
+            background-color: #fff;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            text-align: center;
+            position: relative;
+            cursor: pointer;
+        }
+
+        .file-card.hidden {
+            display: none;
+        }
+
+        .file-icon {
+            font-size: 2em;
+        }
+
+        .file-options {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+        }
+
+        .options-menu {
+            display: none;
+            position: absolute;
+            right: 0;
+            background-color: #fff;
+            border: 1px solid #ddd;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        .options-menu.show {
+            display: block;
+        }
+
+        .options-menu div {
+            padding: 8px;
+            cursor: pointer;
+        }
+
+        .options-menu div:hover {
+            background-color: #f0f0f0;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+        }
+
+        .modal-content {
+            background-color: #fff;
+            margin: 10% auto;
+            padding: 20px;
+            width: 90%;
+            max-width: 800px;
+            border-radius: 8px;
+        }
+
+        .modal-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+        }
+
+        .close-modal {
+            float: right;
+            font-size: 1.5em;
+            cursor: pointer;
+        }
+
+        .file-info-sidebar {
+            position: fixed;
+            right: -400px;
+            top: 0;
+            width: 400px;
+            height: 100%;
+            background-color: #fff;
+            box-shadow: -2px 0 5px rgba(0, 0, 0, 0.2);
+            transition: right 0.3s ease;
+        }
+
+        .file-info-sidebar.active {
+            right: 0;
+        }
+
+        .file-name-container {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            background-color: #f4f4f4;
+        }
+
+        .file-preview iframe,
+        .file-preview img {
+            width: 100%;
+            max-height: 200px;
+        }
+
+        .file-info-header {
+            display: flex;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .file-info-header div {
+            flex: 1;
+            text-align: center;
+            padding: 10px;
+            cursor: pointer;
+        }
+
+        .file-info-header .active {
+            background-color: #e0e0e0;
+        }
+
+        .info-section {
+            display: none;
+            padding: 10px;
+        }
+
+        .info-section.active {
+            display: block;
+        }
+
+        .info-item {
+            margin-bottom: 10px;
+        }
+
+        .info-label {
+            font-weight: bold;
+            margin-right: 5px;
+        }
+
+        .full-preview-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+        }
+
+        .full-preview-content {
+            background-color: #fff;
+            margin: 5% auto;
+            padding: 20px;
+            width: 90%;
+            max-width: 1000px;
+            border-radius: 8px;
+        }
+
+        .close-full-preview {
+            float: right;
+            font-size: 1.5em;
+            cursor: pointer;
+        }
+
+        .custom-alert {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            z-index: 1002;
+        }
+
+        .custom-alert.success {
+            background-color: #28a745;
+            color: white;
+        }
+
+        .custom-alert.error {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        #renameModal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+        }
+
+        #renameModal .modal-content {
+            background-color: #fff;
+            margin: 15% auto;
+            padding: 20px;
+            width: 90%;
+            max-width: 500px;
+            border-radius: 8px;
+        }
+    </style>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js" integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
 </head>
 
 <body>
     <div class="top-nav">
-        <h2><?= htmlspecialchars($user['full_name']) ?>'s Folder</h2>
+        <h2><?= htmlspecialchars($user['Username']) ?>'s Folder</h2>
         <input type="text" placeholder="Search documents..." class="search-bar" id="searchBar">
     </div>
 
     <div class="sidebar">
-        <button class="toggle-btn" title="Toggle Sidebar"><i class="fas fa-bars"></i></button>
+        <button class="toggle-btn" title="Toggle Sidebar" aria-label="Toggle Sidebar"><i class="fas fa-bars"></i></button>
         <h2 class="sidebar-title">Document Archival</h2>
         <?php if ($userRole === 'admin'): ?>
-            <a href="admin_dashboard.php" class="admin-dashboard-btn"><i class="fas fa-user-shield"></i><span class="link-text">Admin Dashboard</span></a>
+            <a href="admin_dashboard.php" data-tooltip="Admin Dashboard"><i class="fas fa-user-shield"></i><span class="link-text">Admin Dashboard</span></a>
         <?php endif; ?>
-        <a href="dashboard.php" class="<?= basename($_SERVER['PHP_SELF']) == 'index.php' ? 'active' : '' ?>"><i class="fas fa-home"></i><span class="link-text">Dashboard</span></a>
-        <a href="my-report.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-report.php' ? 'active' : '' ?>"><i class="fas fa-chart-bar"></i><span class="link-text">My Report</span></a>
-        <a href="my-folder.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-folder.php' ? 'active' : '' ?>"><i class="fas fa-folder"></i><span class="link-text">My Folder</span></a>
+        <a href="dashboard.php" class="<?= basename($_SERVER['PHP_SELF']) == 'dashboard.php' ? 'active' : '' ?>" data-tooltip="Dashboard"><i class="fas fa-home"></i><span class="link-text">Dashboard</span></a>
+        <a href="my-report.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-report.php' ? 'active' : '' ?>" data-tooltip="My Report"><i class="fas fa-chart-bar"></i><span class="link-text">My Report</span></a>
+        <a href="my-folder.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-folder.php' ? 'active' : '' ?>" data-tooltip="My Folder"><i class="fas fa-folder"></i><span class="link-text">My Folder</span></a>
         <?php foreach ($userDepartments as $dept): ?>
-            <a href="department_folder.php?department_id=<?= $dept['id'] ?>" class="<?= isset($_GET['department_id']) && $_GET['department_id'] == $dept['id'] ? 'active' : '' ?>"><i class="fas fa-folder"></i><span class="link-text"><?= htmlspecialchars($dept['name']) ?></span></a>
+            <a href="department_folder.php?department_id=<?= htmlspecialchars($dept['id'], ENT_QUOTES, 'UTF-8') ?>" data-tooltip="<?= htmlspecialchars($dept['name']) ?>"><i class="fas fa-folder"></i><span class="link-text"><?= htmlspecialchars($dept['name']) ?></span></a>
         <?php endforeach; ?>
-        <a href="logout.php" class="logout-btn"><i class="fas fa-sign-out-alt"></i><span class="link-text">Logout</span></a>
+        <a href="logout.php" class="logout-btn" data-tooltip="Logout"><i class="fas fa-sign-out-alt"></i><span class="link-text">Logout</span></a>
     </div>
 
     <div class="main-content">
-        <div class="sub-dept-filter">
-            <button class="sub-dept-btn <?= $subDeptFilter === 'all' ? 'active' : '' ?>" data-sub-dept="all">All Files</button>
-            <button class="sub-dept-btn <?= $subDeptFilter === 'none' ? 'active' : '' ?>" data-sub-dept="none">No Sub-Department</button>
-            <?php foreach ($userSubDepartments as $subDept): ?>
-                <?php if ($subDept['sub_department_id']): ?>
-                    <button class="sub-dept-btn <?= $subDeptFilter == $subDept['sub_department_id'] ? 'active' : '' ?>" data-sub-dept="<?= $subDept['sub_department_id'] ?>"><?= htmlspecialchars($subDept['sub_department_name']) ?></button>
-                <?php endif; ?>
-            <?php endforeach; ?>
-        </div>
-
         <div class="sorting-buttons">
             <button class="sort-btn <?= $sortFilter === 'all' ? 'active' : '' ?>" data-filter="all">All Files</button>
             <button class="sort-btn <?= $sortFilter === 'uploaded-by-me' ? 'active' : '' ?>" data-filter="uploaded-by-me">Uploaded by Me</button>
@@ -180,8 +538,8 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <?php foreach ($documentTypes as $type):
                 $fileCount = count(array_filter($filteredFiles, fn($file) => $file['document_type'] === $type['name']));
             ?>
-                <div class="ftype-card" onclick="openModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name']))) ?>')">
-                    <p><?= ucfirst($type['name']) ?> (<?= $fileCount ?>)</p>
+                <div class="ftype-card" onclick="openModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')">
+                    <p><?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> (<?= $fileCount ?>)</p>
                 </div>
             <?php endforeach; ?>
         </div>
@@ -191,20 +549,20 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 <h3>Uploaded Files</h3>
                 <div class="file-card-container" id="uploadedFiles">
                     <?php foreach (array_slice($uploadedFiles, 0, 4) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name']) ?>" onclick="openSidebar(<?= $file['id'] ?>)">
+                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
-                            <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                            <div class="file-options" onclick="toggleOptions(this)">
+                            <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
+                            <div class="file-options" onclick="toggleOptions(event, this)">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
-                                    <div onclick="handleOption('Rename', <?= $file['id'] ?>)">Rename</div>
+                                    <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
                                     <?php if ($file['user_id'] == $userId): ?>
-                                        <div onclick="handleOption('Delete', <?= $file['id'] ?>)">Delete</div>
+                                        <div onclick="handleOption('Delete', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Delete</div>
                                     <?php endif; ?>
-                                    <div onclick="handleOption('Make Copy', <?= $file['id'] ?>)">Make Copy</div>
-                                    <div onclick="handleOption('File Information', <?= $file['id'] ?>)">File Information</div>
+                                    <div onclick="handleOption('Make Copy', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Make Copy</div>
+                                    <div onclick="handleOption('File Information', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">File Information</div>
                                     <?php if ($file['user_id'] != $userId): ?>
-                                        <div onclick="requestAccess(<?= $file['id'] ?>)">Request Document</div>
+                                        <div onclick="requestAccess(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Request Document</div>
                                     <?php endif; ?>
                                 </div>
                             </div>
@@ -219,20 +577,20 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 <h3>Received Files</h3>
                 <div class="file-card-container" id="receivedFiles">
                     <?php foreach (array_slice($receivedFiles, 0, 4) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name']) ?>" onclick="openSidebar(<?= $file['id'] ?>)">
+                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
-                            <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                            <div class="file-options" onclick="toggleOptions(this)">
+                            <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
+                            <div class="file-options" onclick="toggleOptions(event, this)">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
-                                    <div onclick="handleOption('Rename', <?= $file['id'] ?>)">Rename</div>
+                                    <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
                                     <?php if ($file['user_id'] == $userId): ?>
-                                        <div onclick="handleOption('Delete', <?= $file['id'] ?>)">Delete</div>
+                                        <div onclick="handleOption('Delete', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Delete</div>
                                     <?php endif; ?>
-                                    <div onclick="handleOption('Make Copy', <?= $file['id'] ?>)">Make Copy</div>
-                                    <div onclick="handleOption('File Information', <?= $file['id'] ?>)">File Information</div>
+                                    <div onclick="handleOption('Make Copy', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Make Copy</div>
+                                    <div onclick="handleOption('File Information', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">File Information</div>
                                     <?php if ($file['user_id'] != $userId): ?>
-                                        <div onclick="requestAccess(<?= $file['id'] ?>)">Request Document</div>
+                                        <div onclick="requestAccess(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Request Document</div>
                                     <?php endif; ?>
                                 </div>
                             </div>
@@ -262,7 +620,6 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
         </div>
         <div class="info-section active" id="locationSection">
             <div class="info-item"><span class="info-label">Department:</span><span class="info-value" id="departmentCollege">N/A</span></div>
-            <div class="info-item"><span class="info-label">Sub-Department:</span><span class="info-value" id="subDepartment">N/A</span></div>
             <div class="info-item"><span class="info-label">Physical Location:</span><span class="info-value" id="physicalLocation">Not assigned</span></div>
             <div class="info-item"><span class="info-label">Cabinet:</span><span class="info-value" id="cabinet">N/A</span></div>
             <div class="info-item"><span class="info-label">Layer/Box/Folder:</span><span class="info-value" id="storageDetails">N/A</span></div>
@@ -295,26 +652,26 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
     </div>
 
     <?php foreach ($documentTypes as $type): ?>
-        <div id="<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name']))) ?>Modal" class="modal">
+        <div id="<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>Modal" class="modal">
             <div class="modal-content">
-                <button class="close-modal" onclick="closeModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name']))) ?>')">✕</button>
-                <h2><?= ucfirst($type['name']) ?> Files</h2>
+                <button class="close-modal" onclick="closeModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')">✕</button>
+                <h2><?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> Files</h2>
                 <div class="modal-grid">
                     <?php foreach (array_filter($filteredFiles, fn($file) => $file['document_type'] === $type['name']) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name']) ?>" onclick="openSidebar(<?= $file['id'] ?>)">
+                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
-                            <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                            <div class="file-options" onclick="toggleOptions(this)">
+                            <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
+                            <div class="file-options" onclick="toggleOptions(event, this)">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
-                                    <div onclick="handleOption('Rename', <?= $file['id'] ?>)">Rename</div>
+                                    <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
                                     <?php if ($file['user_id'] == $userId): ?>
-                                        <div onclick="handleOption('Delete', <?= $file['id'] ?>)">Delete</div>
+                                        <div onclick="handleOption('Delete', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Delete</div>
                                     <?php endif; ?>
-                                    <div onclick="handleOption('Make Copy', <?= $file['id'] ?>)">Make Copy</div>
-                                    <div onclick="handleOption('File Information', <?= $file['id'] ?>)">File Information</div>
+                                    <div onclick="handleOption('Make Copy', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Make Copy</div>
+                                    <div onclick="handleOption('File Information', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">File Information</div>
                                     <?php if ($file['user_id'] != $userId): ?>
-                                        <div onclick="requestAccess(<?= $file['id'] ?>)">Request Document</div>
+                                        <div onclick="requestAccess(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Request Document</div>
                                     <?php endif; ?>
                                 </div>
                             </div>
@@ -331,20 +688,20 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <h2>All Uploaded Files</h2>
             <div class="modal-grid">
                 <?php foreach ($uploadedFiles as $file): ?>
-                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name']) ?>" onclick="openSidebar(<?= $file['id'] ?>)">
+                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
                         <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
-                        <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                        <div class="file-options" onclick="toggleOptions(this)">
+                        <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
+                        <div class="file-options" onclick="toggleOptions(event, this)">
                             <i class="fas fa-ellipsis-v"></i>
                             <div class="options-menu">
-                                <div onclick="handleOption('Rename', <?= $file['id'] ?>)">Rename</div>
+                                <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
                                 <?php if ($file['user_id'] == $userId): ?>
-                                    <div onclick="handleOption('Delete', <?= $file['id'] ?>)">Delete</div>
+                                    <div onclick="handleOption('Delete', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Delete</div>
                                 <?php endif; ?>
-                                <div onclick="handleOption('Make Copy', <?= $file['id'] ?>)">Make Copy</div>
-                                <div onclick="handleOption('File Information', <?= $file['id'] ?>)">File Information</div>
+                                <div onclick="handleOption('Make Copy', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Make Copy</div>
+                                <div onclick="handleOption('File Information', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">File Information</div>
                                 <?php if ($file['user_id'] != $userId): ?>
-                                    <div onclick="requestAccess(<?= $file['id'] ?>)">Request Document</div>
+                                    <div onclick="requestAccess(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Request Document</div>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -360,20 +717,20 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <h2>All Received Files</h2>
             <div class="modal-grid">
                 <?php foreach ($receivedFiles as $file): ?>
-                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name']) ?>" onclick="openSidebar(<?= $file['id'] ?>)">
+                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
                         <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
-                        <p class="file-name"><?= htmlspecialchars($file['file_name']) ?></p>
-                        <div class="file-options" onclick="toggleOptions(this)">
+                        <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
+                        <div class="file-options" onclick="toggleOptions(event, this)">
                             <i class="fas fa-ellipsis-v"></i>
                             <div class="options-menu">
-                                <div onclick="handleOption('Rename', <?= $file['id'] ?>)">Rename</div>
+                                <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
                                 <?php if ($file['user_id'] == $userId): ?>
-                                    <div onclick="handleOption('Delete', <?= $file['id'] ?>)">Delete</div>
+                                    <div onclick="handleOption('Delete', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Delete</div>
                                 <?php endif; ?>
-                                <div onclick="handleOption('Make Copy', <?= $file['id'] ?>)">Make Copy</div>
-                                <div onclick="handleOption('File Information', <?= $file['id'] ?>)">File Information</div>
+                                <div onclick="handleOption('Make Copy', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Make Copy</div>
+                                <div onclick="handleOption('File Information', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">File Information</div>
                                 <?php if ($file['user_id'] != $userId): ?>
-                                    <div onclick="requestAccess(<?= $file['id'] ?>)">Request Document</div>
+                                    <div onclick="requestAccess(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Request Document</div>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -383,17 +740,38 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
         </div>
     </div>
 
-    <script>
-        // Sidebar toggle
-        document.querySelector('.toggle-btn').addEventListener('click', () => {
-            const sidebar = document.querySelector('.sidebar');
-            const topNav = document.querySelector('.top-nav');
-            sidebar.classList.toggle('minimized');
-            topNav.classList.toggle('resized', sidebar.classList.contains('minimized'));
-        });
+    <div id="renameModal" class="modal">
+        <div class="modal-content">
+            <button class="close-modal" onclick="closeModal('rename')">✕</button>
+            <h2>Rename File</h2>
+            <form id="renameForm">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
+                <input type="hidden" name="file_id" id="renameFileId">
+                <label for="renameFileName">New File Name:</label>
+                <input type="text" id="renameFileName" name="new_name" required maxlength="255">
+                <button type="submit">Rename</button>
+            </form>
+        </div>
+    </div>
 
-        // File options menu
-        function toggleOptions(element) {
+    <script>
+        // Initialize DOM elements
+        const searchBar = document.getElementById('searchBar');
+        const renameForm = document.getElementById('renameForm');
+        const renameModal = document.getElementById('renameModal');
+
+        // Initialize sidebar toggle
+        function initializeSidebarToggle() {
+            document.querySelector('.toggle-btn').addEventListener('click', () => {
+                const sidebar = document.querySelector('.sidebar');
+                const topNav = document.querySelector('.top-nav');
+                sidebar.classList.toggle('minimized');
+                topNav.classList.toggle('resized', sidebar.classList.contains('minimized'));
+            });
+        }
+
+        // Toggle file options menu
+        function toggleOptions(event, element) {
             document.querySelectorAll('.options-menu').forEach(menu => {
                 if (menu !== element.querySelector('.options-menu')) menu.classList.remove('show');
             });
@@ -413,89 +791,69 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 showAlert('Invalid file ID', 'error');
                 return;
             }
-            if (option === 'File Information') {
-                openSidebar(fileId);
-            } else if (option === 'Rename') {
-                renameFile(fileId);
-            } else if (option === 'Delete') {
-                deleteFile(fileId);
-            } else if (option === 'Make Copy') {
-                makeCopy(fileId);
-            } else {
-                showAlert(`Handling option: ${option} for file ID: ${fileId}`, 'success');
-            }
-        }
-
-        // File operations
-        function renameFile(fileId) {
-            const newName = prompt('Enter the new file name:');
-            if (newName) {
-                fetch('rename_file.php', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            file_id: fileId,
-                            new_name: newName
-                        })
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            showAlert('File renamed successfully', 'success', () => location.reload());
-                        } else {
-                            showAlert('Failed to rename file: ' + (data.message || 'Unknown error'), 'error');
-                        }
-                    })
-                    .catch(error => showAlert('Server error: ' + error, 'error'));
-            }
-        }
-
-        function deleteFile(fileId) {
-            if (confirm('Are you sure you want to delete this file?')) {
-                fetch('delete_file.php', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
+            switch (option) {
+                case 'Rename':
+                    openRenameModal(fileId);
+                    break;
+                case 'Delete':
+                    if (confirm('Are you sure you want to delete this file?')) {
+                        performFileAction('delete_file.php', {
                             file_id: fileId
-                        })
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            showAlert('File deleted successfully', 'success', () => location.reload());
-                        } else {
-                            showAlert('Failed to delete file: ' + (data.message || 'Unknown error'), 'error');
-                        }
-                    })
-                    .catch(error => showAlert('Server error: ' + error, 'error'));
+                        });
+                    }
+                    break;
+                case 'Make Copy':
+                    performFileAction('make_copy.php', {
+                        file_id: fileId
+                    });
+                    break;
+                case 'File Information':
+                    openSidebar(fileId);
+                    break;
+                case 'Request Document':
+                    requestAccess(fileId);
+                    break;
+                default:
+                    showAlert(`Unknown option: ${option}`, 'error');
             }
         }
 
-        function makeCopy(fileId) {
-            fetch('make_copy.php', {
+        // Open rename modal
+        function openRenameModal(fileId) {
+            document.getElementById('renameFileId').value = fileId;
+            renameModal.style.display = 'flex';
+            renameModal.classList.add('open');
+            const modalContent = renameModal.querySelector('.modal-content');
+            if (modalContent) {
+                setTimeout(() => modalContent.classList.add('open'), 10);
+            }
+        }
+
+        // Perform file action via AJAX
+        function performFileAction(url, data) {
+            data.csrf_token = '<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>';
+            fetch(url, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({
-                        file_id: fileId
-                    })
+                    body: JSON.stringify(data)
                 })
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        showAlert('File copy created successfully', 'success', () => location.reload());
+                        showAlert(data.message, 'success', () => window.location.reload());
                     } else {
-                        showAlert('Failed to create copy: ' + (data.message || 'Unknown error'), 'error');
+                        showAlert(`Error: ${data.message || 'Unknown error'}`, 'error');
                     }
                 })
-                .catch(error => showAlert('Server error: ' + error, 'error'));
+                .catch(error => {
+                    console.error('Error:', error);
+                    showAlert('An error occurred while processing the request.', 'error');
+                });
         }
 
+        // Request access to a file
         function requestAccess(fileId) {
             fetch('handle_access_request.php', {
                     method: 'POST',
@@ -504,7 +862,8 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     },
                     body: JSON.stringify({
                         file_id: fileId,
-                        action: 'request'
+                        action: 'request',
+                        csrf_token: '<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>'
                     })
                 })
                 .then(response => response.json())
@@ -512,10 +871,13 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     if (data.success) {
                         showAlert('Access request sent successfully', 'success');
                     } else {
-                        showAlert('Failed to send access request: ' + (data.message || 'Unknown error'), 'error');
+                        showAlert(`Failed to send access request: ${data.message || 'Unknown error'}`, 'error');
                     }
                 })
-                .catch(error => showAlert('Server error: ' + error, 'error'));
+                .catch(error => {
+                    console.error('Error:', error);
+                    showAlert('An error occurred while requesting access.', 'error');
+                });
         }
 
         // Open file info sidebar
@@ -527,13 +889,13 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 .then(response => {
                     if (!response.ok) {
                         return response.json().then(err => {
-                            throw new Error(`Server error: ${err.error || 'Unknown error'}`);
+                            throw new Error(err.error || 'Unknown error');
                         });
                     }
                     return response.json();
                 })
                 .then(data => {
-                    if (data.error) {
+                    if (!data.success) {
                         showAlert(`Error: ${data.error}`, 'error');
                         return;
                     }
@@ -541,7 +903,6 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     const elements = {
                         sidebarFileName: document.getElementById('sidebarFileName'),
                         departmentCollege: document.getElementById('departmentCollege'),
-                        subDepartment: document.getElementById('subDepartment'),
                         physicalLocation: document.getElementById('physicalLocation'),
                         cabinet: document.getElementById('cabinet'),
                         storageDetails: document.getElementById('storageDetails'),
@@ -564,37 +925,33 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         }
                     }
 
-                    elements.sidebarFileName.textContent = data.file_name || 'Unnamed File';
-                    elements.departmentCollege.textContent = data.department_name || 'N/A';
-                    elements.subDepartment.textContent = data.sub_department_name || 'N/A';
-                    elements.physicalLocation.textContent = data.hard_copy_available ?
-                        (data.cabinet_name ? 'Assigned' : 'Not assigned') : 'Digital only';
-                    elements.cabinet.textContent = data.cabinet_name || 'N/A';
-                    elements.storageDetails.textContent =
-                        data.layer && data.box && data.folder ?
-                        `${data.layer}/${data.box}/${data.folder}` : 'N/A';
-                    elements.uploader.textContent = data.uploader_name || 'N/A';
-                    elements.fileType.textContent = data.file_type || 'N/A';
-                    elements.fileSize.textContent = data.file_size ? formatFileSize(data.file_size) : 'N/A';
-                    elements.fileCategory.textContent = data.document_type || 'N/A';
-                    elements.dateUpload.textContent = data.upload_date || 'N/A';
-                    elements.pages.textContent = data.pages || 'N/A';
-                    elements.purpose.textContent = data.purpose || 'Not specified';
-                    elements.subject.textContent = data.subject || 'Not specified';
+                    elements.sidebarFileName.textContent = data.data.file_name || 'Unnamed File';
+                    elements.departmentCollege.textContent = data.data.department_name || 'N/A';
+                    elements.physicalLocation.textContent = data.data.hard_copy_available ? (data.data.cabinet_name !== 'N/A' ? 'Assigned' : 'Not assigned') : 'Digital only';
+                    elements.cabinet.textContent = data.data.cabinet_name || 'N/A';
+                    elements.storageDetails.textContent = data.data.layer !== 'N/A' && data.data.box !== 'N/A' && data.data.folder !== 'N/A' ? `${data.data.layer}/${data.data.box}/${data.data.folder}` : 'N/A';
+                    elements.uploader.textContent = data.data.uploader_name || 'N/A';
+                    elements.fileType.textContent = data.data.file_type || 'N/A';
+                    elements.fileSize.textContent = data.data.file_size ? formatFileSize(data.data.file_size) : 'N/A';
+                    elements.fileCategory.textContent = data.data.document_type || 'N/A';
+                    elements.dateUpload.textContent = data.data.upload_date || 'N/A';
+                    elements.pages.textContent = data.data.pages || 'N/A';
+                    elements.purpose.textContent = data.data.purpose || 'Not specified';
+                    elements.subject.textContent = data.data.subject || 'Not specified';
 
                     elements.filePreview.innerHTML = '';
-                    if (data.file_path) {
-                        const ext = data.file_type.toLowerCase();
+                    if (data.data.file_path) {
+                        const ext = data.data.file_type.toLowerCase();
                         if (ext === 'pdf') {
-                            elements.filePreview.innerHTML = `<iframe src="${data.file_path}" title="File Preview"></iframe><p>Click to view full file${data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
-                            elements.filePreview.querySelector('iframe').addEventListener('click', () => openFullPreview(data.file_path));
+                            elements.filePreview.innerHTML = `<iframe src="${data.data.file_path}" title="File Preview"></iframe><p>Click to view full file${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
+                            elements.filePreview.querySelector('iframe').addEventListener('click', () => openFullPreview(data.data.file_path));
                         } else if (['jpg', 'png', 'jpeg', 'gif'].includes(ext)) {
-                            elements.filePreview.innerHTML = `<img src="${data.file_path}" alt="File Preview"><p>Click to view full image${data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
-                            elements.filePreview.querySelector('img').addEventListener('click', () => openFullPreview(data.file_path));
+                            elements.filePreview.innerHTML = `<img src="${data.data.file_path}" alt="File Preview"><p>Click to view full image${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
+                            elements.filePreview.querySelector('img').addEventListener('click', () => openFullPreview(data.data.file_path));
                         } else {
                             elements.filePreview.innerHTML = '<p>Preview not available for this file type</p>';
                         }
-                    } else if (data.hard_copy_available) {
+                    } else if (data.data.hard_copy_available) {
                         elements.filePreview.innerHTML = '<p>Hardcopy - No digital preview available</p>';
                     } else {
                         elements.filePreview.innerHTML = '<p>No preview available (missing file data)</p>';
@@ -605,35 +962,35 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     detailsSection.innerHTML = '<h3>File Details</h3>';
                     const baseFields = [{
                             label: 'Uploader',
-                            value: data.uploader_name || 'N/A'
+                            value: data.data.uploader_name || 'N/A'
                         },
                         {
                             label: 'File Type',
-                            value: data.file_type || 'N/A'
+                            value: data.data.file_type || 'N/A'
                         },
                         {
                             label: 'File Size',
-                            value: data.file_size ? formatFileSize(data.file_size) : 'N/A'
+                            value: data.data.file_size ? formatFileSize(data.data.file_size) : 'N/A'
                         },
                         {
                             label: 'Category',
-                            value: data.document_type || 'N/A'
+                            value: data.data.document_type || 'N/A'
                         },
                         {
                             label: 'Date Uploaded',
-                            value: data.upload_date || 'N/A'
+                            value: data.data.upload_date || 'N/A'
                         },
                         {
                             label: 'Pages',
-                            value: data.pages || 'N/A'
+                            value: data.data.pages || 'N/A'
                         },
                         {
                             label: 'Purpose',
-                            value: data.purpose || 'Not specified'
+                            value: data.data.purpose || 'Not specified'
                         },
                         {
                             label: 'Subject',
-                            value: data.subject || 'Not specified'
+                            value: data.data.subject || 'Not specified'
                         }
                     ];
                     baseFields.forEach(field => {
@@ -644,18 +1001,18 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         </div>`;
                     });
 
-                    if (data.document_type) {
+                    if (data.data.document_type) {
                         $.ajax({
                             url: 'get_document_type.php',
                             method: 'GET',
                             data: {
-                                document_type_name: data.document_type
+                                document_type_name: data.data.document_type
                             },
                             dataType: 'json',
                             success: function(fieldsData) {
-                                if (fieldsData.success && fieldsData.fields) {
-                                    fieldsData.fields.forEach(field => {
-                                        const value = data[field.field_name] || 'N/A';
+                                if (fieldsData.success && fieldsData.data && fieldsData.data.fields) {
+                                    fieldsData.data.fields.forEach(field => {
+                                        const value = data.data[field.field_name] || 'N/A';
                                         detailsSection.innerHTML += `
                                         <div class="info-item">
                                             <span class="info-label">${field.field_label}:</span>
@@ -681,7 +1038,10 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         // Fetch access information
         function fetchAccessInfo(fileId) {
-            fetch(`get_access_info.php?file_id=${fileId}`)
+            fetch(`get_access_info.php?file_id=${fileId}`, {
+                    method: 'GET',
+                    credentials: 'same-origin'
+                })
                 .then(response => response.json())
                 .then(data => {
                     const accessUsers = document.getElementById('accessUsers');
@@ -691,14 +1051,11 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         return;
                     }
                     accessUsers.innerHTML = '';
-                    if (data.sub_department_name) {
-                        accessUsers.innerHTML = `<div>Restricted to ${data.sub_department_name}</div>`;
-                        accessInfo.textContent = 'Sub-department access only';
-                    } else if (data.users && data.users.length > 0) {
-                        data.users.forEach(user => {
+                    if (data.data && data.data.users && data.data.users.length > 0) {
+                        data.data.users.forEach(user => {
                             accessUsers.innerHTML += `<div>${user.full_name} (${user.role})</div>`;
                         });
-                        accessInfo.textContent = `${data.users.length} user(s) have access`;
+                        accessInfo.textContent = `${data.data.users.length} user(s) have access`;
                     } else {
                         accessUsers.innerHTML = '<div>Department-wide access</div>';
                         accessInfo.textContent = 'All department users have access';
@@ -720,11 +1077,9 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 if (modalContent) {
                     setTimeout(() => modalContent.classList.add('open'), 10);
                 } else {
-                    console.error(`Modal content not found for ${type}Modal`);
                     showAlert('UI error: Modal content missing', 'error');
                 }
             } else {
-                console.error(`Modal with ID ${type}Modal not found`);
                 showAlert(`Error: Modal for ${type} not found`, 'error');
             }
         }
@@ -774,7 +1129,7 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         // Search filter
         function filterFiles() {
-            const searchQuery = document.getElementById('searchBar').value.toLowerCase();
+            const searchQuery = searchBar.value.toLowerCase();
             const containers = ['uploadedFiles', 'receivedFiles'];
             let hasResults = false;
             containers.forEach(containerId => {
@@ -794,24 +1149,25 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             });
         }
 
-        document.getElementById('searchBar').addEventListener('input', filterFiles);
-
-        // Sorting and sub-department buttons
-        document.querySelectorAll('.sort-btn').forEach(button => {
-            button.addEventListener('click', function() {
-                const filter = this.getAttribute('data-filter');
-                const subDept = new URLSearchParams(window.location.search).get('sub_dept') || 'all';
-                window.location.href = `my-folder.php?sort=${filter}&sub_dept=${subDept}`;
+        // Initialize sorting buttons
+        function initializeSortButtons() {
+            document.querySelectorAll('.sort-btn').forEach(button => {
+                button.addEventListener('click', function() {
+                    const filter = this.getAttribute('data-filter');
+                    window.location.href = `my-folder.php?sort=${filter}`;
+                });
             });
-        });
+        }
 
-        document.querySelectorAll('.sub-dept-btn').forEach(button => {
-            button.addEventListener('click', function() {
-                const subDept = this.getAttribute('data-sub-dept');
-                const sort = new URLSearchParams(window.location.search).get('sort') || 'all';
-                window.location.href = `my-folder.php?sort=${sort}&sub_dept=${subDept}`;
+        // Handle rename form submission
+        function initializeRenameForm() {
+            renameForm.addEventListener('submit', function(event) {
+                event.preventDefault();
+                const formData = new FormData(this);
+                const data = Object.fromEntries(formData);
+                performFileAction('rename_file.php', data);
             });
-        });
+        }
 
         // Alert function
         function showAlert(message, type, callback = null) {
@@ -822,6 +1178,7 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 <button onclick="this.parentElement.remove(); ${callback ? 'callback()' : ''}">OK</button>
             `;
             document.body.appendChild(alertDiv);
+            setTimeout(() => alertDiv.remove(), 5000);
         }
 
         // File size formatter
@@ -833,14 +1190,25 @@ $userSubDepartments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // Keyboard navigation
-        document.querySelectorAll('.file-card, .ftype-card, .sort-btn, .sub-dept-btn').forEach(element => {
-            element.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    element.click();
-                }
+        // Initialize keyboard navigation
+        function initializeKeyboardNavigation() {
+            document.querySelectorAll('.file-card, .ftype-card, .sort-btn').forEach(element => {
+                element.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        element.click();
+                    }
+                });
             });
+        }
+
+        // Initialize all functionality
+        document.addEventListener('DOMContentLoaded', () => {
+            searchBar.addEventListener('input', filterFiles);
+            initializeSortButtons();
+            initializeRenameForm();
+            initializeSidebarToggle();
+            initializeKeyboardNavigation();
         });
     </script>
 </body>

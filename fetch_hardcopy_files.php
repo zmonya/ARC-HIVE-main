@@ -2,7 +2,7 @@
 session_start();
 require 'db_connection.php';
 require 'log_activity.php';
-require 'vendor/autoload.php'; // Load Composer autoloader for phpdotenv
+require 'vendor/autoload.php';
 
 use Dotenv\Dotenv;
 
@@ -17,7 +17,7 @@ ini_set('error_log', __DIR__ . '/logs/error_log.log');
 error_reporting(E_ALL);
 
 /**
- * Generates a JSON response with appropriate HTTP status.
+ * Sends a JSON response with appropriate HTTP status.
  *
  * @param bool $success
  * @param string $message
@@ -38,7 +38,7 @@ function sendResponse(bool $success, string $message, array $data, int $statusCo
  *
  * @param int $departmentId
  * @return int User ID
- * @throws Exception If user is not authenticated or lacks department access
+ * @throws Exception If user is not authenticated or lacks access
  */
 function validateUserSessionAndDepartment(int $departmentId): int
 {
@@ -57,39 +57,56 @@ function validateUserSessionAndDepartment(int $departmentId): int
 }
 
 try {
-    $departmentId = filter_input(INPUT_GET, 'department_id', FILTER_VALIDATE_INT);
-    if (!$departmentId) {
-        sendResponse(false, 'Department ID not provided.', [], 400);
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        sendResponse(false, 'Invalid request method.', [], 405);
+    }
+    if (!isset($_POST['csrf_token']) || !validateCsrfToken($_POST['csrf_token'])) {
+        sendResponse(false, 'Invalid CSRF token.', [], 403);
+    }
+
+    $departmentId = filter_input(INPUT_POST, 'department_id', FILTER_VALIDATE_INT);
+    if (!$departmentId || $departmentId <= 0) {
+        sendResponse(false, 'Invalid department ID.', [], 400);
     }
 
     $userId = validateUserSessionAndDepartment($departmentId);
 
     global $pdo;
 
-    // Query hardcopy files using transaction and files.Copy_type
+    // Fetch hardcopy files for the department
     $stmt = $pdo->prepare("
-        SELECT f.File_id AS id, f.File_name AS file_name
+        SELECT f.File_id AS id, f.File_name AS file_name, f.Meta_data
         FROM files f
         JOIN transaction t ON f.File_id = t.File_id
         JOIN users_department ud ON t.Users_Department_id = ud.Users_Department_id
-        WHERE ud.Department_id = ?
-        AND f.Copy_type = 'hard'
+        WHERE ud.Department_id = ? 
+        AND f.Copy_type = 'hard' 
         AND f.File_status != 'deleted'
-        AND t.Transaction_type = 8
         ORDER BY f.Upload_date DESC
     ");
     $stmt->execute([$departmentId]);
     $files = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Log request in transaction table
+    // Log the fetch request
     $stmt = $pdo->prepare("
         INSERT INTO transaction (User_id, Transaction_status, Transaction_type, Time, Massage)
         VALUES (?, 'completed', 8, NOW(), ?)
     ");
-    $stmt->execute([$userId, "Fetched hardcopy files for department: $departmentId"]);
+    $stmt->execute([$userId, "Fetched hardcopy files for department ID: $departmentId"]);
 
     sendResponse(true, 'Hardcopy files retrieved successfully.', ['files' => $files], 200);
 } catch (Exception $e) {
     error_log("Error in fetch_hardcopy_files.php: " . $e->getMessage());
     sendResponse(false, 'Server error: ' . $e->getMessage(), [], 500);
+}
+
+/**
+ * Validates CSRF token.
+ *
+ * @param string $csrfToken
+ * @return bool
+ */
+function validateCsrfToken(string $csrfToken): bool
+{
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $csrfToken);
 }
