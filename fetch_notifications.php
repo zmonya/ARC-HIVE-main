@@ -96,7 +96,7 @@ try {
     if ($notifications) {
         sendResponse(true, 'Notifications retrieved successfully.', ['notifications' => $notifications], 200);
     } else {
-        sendResponse(false, 'No new notifications.', [], 200);
+        sendResponse(true, 'No notifications available.', ['notifications' => []], 200);
     }
 } catch (Exception $e) {
     error_log("Error in fetch_notifications.php: " . $e->getMessage());

@@ -77,12 +77,13 @@ $stmt = $pdo->prepare("
 $stmt->execute([$userId]);
 $notificationLogs = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch activity logs (excluding notifications)
+// Fetch activity logs (only user-initiated actions)
 $stmt = $pdo->prepare("
     SELECT t.Transaction_id, t.Massage AS action, t.Time AS timestamp
     FROM transaction t
     LEFT JOIN files f ON t.File_id = f.File_id
-    WHERE t.User_id = ? AND t.Transaction_type != 12
+    WHERE t.User_id = ? 
+    AND t.Transaction_type IN (1, 2, 10, 11, 13, 14, 15)
     AND (f.File_status != 'deleted' OR f.File_id IS NULL)
     ORDER BY t.Time DESC
     LIMIT 5
@@ -188,93 +189,24 @@ function getFileIcon(string $fileName): string
     <meta http-equiv="X-XSS-Protection" content="1; mode=block">
     <title>Dashboard - Document Archival</title>
     <link rel="stylesheet" href="https://code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css">
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <script src="https://code.jquery.com/ui/1.12.1/jquery-ui.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
+    <link href="arXiv.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/notyf@3/notyf.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/notyf@3/notyf.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-    <link rel="stylesheet" href="style/Dashboard.css">
+    <link rel="stylesheet" href="style/dashboard.css">
     <link rel="stylesheet" href="style/client-sidebar.css">
     <style>
-        .select2-container--open .select2-dropdown {
-            z-index: 3000 !important;
-        }
-
-        .file-item {
-            cursor: pointer;
+        .notification-log .no-notifications {
+            color: #6c757d;
+            font-style: italic;
+            text-align: center;
             padding: 10px;
-            border: 1px solid #ddd;
-            margin: 5px;
-        }
-
-        .file-item.selected {
-            background-color: #e6f3ff;
-            border-color: #007bff;
-        }
-
-        .popup-questionnaire {
-            display: none;
-            padding: 20px;
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
-        }
-
-        .notification-item.pending-access {
-            background: #fff3cd;
-        }
-
-        .notification-item.processed-access {
-            background: #d4edda;
-        }
-
-        .hard-copy-indicator {
-            font-size: 0.8em;
-            color: #555;
-        }
-
-        .file-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 10px;
-        }
-
-        .log-entries {
-            max-height: 200px;
-            overflow-y: auto;
-        }
-
-        .btn-back,
-        .btn-next {
-            padding: 8px 16px;
-            margin: 5px;
-        }
-
-        .exit-button {
-            float: right;
-            font-size: 1.2em;
-            cursor: pointer;
-        }
-
-        .hardcopy-options {
-            margin-top: 10px;
-        }
-
-        .radio-group {
-            margin: 10px 0;
-        }
-
-        .storage-suggestion {
-            margin: 10px 0;
         }
     </style>
 </head>
 
 <body>
-    <div class="sidebar">
+    <aside class="sidebar">
         <button class="toggle-btn" title="Toggle Sidebar" aria-label="Toggle Sidebar"><i class="fas fa-bars"></i></button>
         <h2 class="sidebar-title">Document Archival</h2>
         <?php if ($userRole === 'admin'): ?>
@@ -292,9 +224,9 @@ function getFileIcon(string $fileName): string
             </a>
         <?php endforeach; ?>
         <a href="logout.php" class="logout-btn" data-tooltip="Logout"><i class="fas fa-sign-out-alt"></i><span class="link-text">Logout</span></a>
-    </div>
+    </aside>
 
-    <div class="top-nav">
+    <header class="top-nav">
         <h2>Dashboard</h2>
         <form action="search.php" method="GET" class="search-container" id="search-form">
             <input type="text" id="searchInput" name="q" placeholder="Search documents..." value="<?= htmlspecialchars($_GET['q'] ?? '') ?>">
@@ -319,10 +251,10 @@ function getFileIcon(string $fileName): string
             <button type="submit" aria-label="Search Documents"><i class="fas fa-search"></i></button>
         </form>
         <i class="fas fa-history activity-log-icon" onclick="toggleActivityLog()" title="View Activity Log" aria-label="View Activity Log"></i>
-    </div>
+    </header>
 
-    <div class="main-content">
-        <div class="user-id-calendar-container">
+    <main class="main-content">
+        <section class="user-id-calendar-container">
             <div class="user-id">
                 <img src="<?= htmlspecialchars($user['Profile_pic'] ? 'data:image/jpeg;base64,' . base64_encode($user['Profile_pic']) : 'user.jpg') ?>"
                     alt="User Picture" class="user-picture">
@@ -336,9 +268,9 @@ function getFileIcon(string $fileName): string
                 <p id="currentDate"></p>
                 <p id="currentTime"></p>
             </div>
-        </div>
+        </section>
 
-        <div class="upload-activity-container">
+        <section class="upload-activity-container">
             <div class="upload-file" id="upload">
                 <h3>Send a Document</h3>
                 <button id="selectDocumentButton">Select Document</button>
@@ -363,15 +295,15 @@ function getFileIcon(string $fileName): string
                             </div>
                         <?php endforeach; ?>
                     <?php else: ?>
-                        <div class="log-entry">
+                        <div class="log-entry no-notifications">
                             <p>No new notifications.</p>
                         </div>
                     <?php endif; ?>
                 </div>
             </div>
-        </div>
+        </section>
 
-        <div class="owned-files-section">
+        <section class="owned-files-section">
             <h2>My Files</h2>
             <div class="files-grid">
                 <div class="file-subsection">
@@ -483,7 +415,7 @@ function getFileIcon(string $fileName): string
                     </div>
                 <?php endforeach; ?>
             </div>
-        </div>
+        </section>
 
         <!-- Popups -->
         <div class="popup-file-selection" id="fileSelectionPopup">
@@ -578,7 +510,7 @@ function getFileIcon(string $fileName): string
 
         <div class="popup-questionnaire" id="sendFilePopup">
             <button class="exit-button" onclick="closePopup('sendFilePopup')" aria-label="Close Popup">×</button>
-            <h3>Send File</h3>
+            <h3>Send a File</h3>
             <form id="sendFileForm">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
                 <label for="recipients">Recipients (Users or Departments):</label>
@@ -681,7 +613,7 @@ function getFileIcon(string $fileName): string
             <p id="alreadyProcessedMessage"></p>
         </div>
 
-        <div class="activity-log" id="activityLog" style="display: none;">
+        <div class="activity-log" id="activityLog">
             <h3>Activity Log</h3>
             <div class="log-entries">
                 <?php if (!empty($activityLogs)): ?>
@@ -693,14 +625,18 @@ function getFileIcon(string $fileName): string
                         </div>
                     <?php endforeach; ?>
                 <?php else: ?>
-                    <div class="log-entry">
+                    <div class="log-entry no-notifications">
                         <p>No recent activity.</p>
                     </div>
                 <?php endif; ?>
             </div>
         </div>
-    </div>
+    </main>
 
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://code.jquery.com/ui/1.12.1/jquery-ui.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/notyf@3/notyf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script>
         const notyf = new Notyf();
         let selectedFile = null;
@@ -883,14 +819,14 @@ function getFileIcon(string $fileName): string
         function fetchNotifications() {
             $.ajax({
                 url: 'fetch_notifications.php',
-                method: 'POST',
+                method: 'GET',
                 data: {
                     csrf_token: '<?= htmlspecialchars($_SESSION['csrf_token']) ?>'
                 },
                 dataType: 'json',
                 success: function(data) {
                     const notificationContainer = $('.notification-log .log-entries');
-                    if (data.success && Array.isArray(data.notifications) && data.notifications.length > 0) {
+                    if (data.success) {
                         const currentIds = notificationContainer.find('.notification-item').map(function() {
                             return $(this).data('notification-id');
                         }).get();
@@ -898,27 +834,32 @@ function getFileIcon(string $fileName): string
 
                         if (JSON.stringify(currentIds) !== JSON.stringify(newIds)) {
                             notificationContainer.empty();
-                            data.notifications.forEach(n => {
-                                const notificationClass = n.status === 'pending' ? 'pending-access' : 'processed-access';
-                                notificationContainer.append(`
-                                    <div class="log-entry notification-item ${notificationClass}"
-                                         data-notification-id="${n.id}"
-                                         data-file-id="${n.file_id || ''}"
-                                         data-message="${n.message}"
-                                         data-status="${n.status}">
-                                        <i class="fas fa-bell"></i>
-                                        <p>${n.message}</p>
-                                        <span>${new Date(n.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
-                                    </div>
-                                `);
-                            });
+                            if (data.notifications.length > 0) {
+                                data.notifications.forEach(n => {
+                                    const notificationClass = n.status === 'pending' ? 'pending-access' : 'processed-access';
+                                    notificationContainer.append(`
+                                        <div class="log-entry notification-item ${notificationClass}"
+                                             data-notification-id="${n.id}"
+                                             data-file-id="${n.file_id || ''}"
+                                             data-message="${n.message}"
+                                             data-status="${n.status}">
+                                            <i class="fas fa-bell"></i>
+                                            <p>${n.message}</p>
+                                            <span>${new Date(n.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</span>
+                                        </div>
+                                    `);
+                                });
+                            } else {
+                                notificationContainer.empty().append('<div class="log-entry no-notifications"><p>No new notifications.</p></div>');
+                            }
                         }
                     } else {
-                        notificationContainer.empty().append('<div class="log-entry"><p>No new notifications.</p></div>');
+                        notyf.error(data.message);
                     }
                 },
-                error: function() {
-                    notyf.error('Failed to fetch notifications.');
+                error: function(jqXHR, textStatus, errorThrown) {
+                    console.error('Notification fetch error:', textStatus, errorThrown, jqXHR.responseText);
+                    notyf.error('Failed to fetch notifications. Check console for details.');
                 }
             });
         }
@@ -1149,6 +1090,7 @@ function getFileIcon(string $fileName): string
             formData.append('csrf_token', '<?= htmlspecialchars($_SESSION['csrf_token']) ?>');
             formData.append('hard_copy_available', $('#hardcopyCheckbox').is(':checked') ? 1 : 0);
             formData.append('cabinet', $('#cabinet').val());
+
             if ($('#hardcopyCheckbox').is(':checked') && $('input[name="hardcopyOption"]:checked').val() === 'new') {
                 formData.append('layer', $('#layer').val() || window.storageMetadata?.layer || 0);
                 formData.append('box', $('#box').val() || window.storageMetadata?.box || 0);

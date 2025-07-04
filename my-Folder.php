@@ -222,296 +222,25 @@ try {
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
     <meta http-equiv="X-Frame-Options" content="DENY">
     <meta http-equiv="X-XSS-Protection" content="1; mode=block">
-    <title><?= htmlspecialchars($user['Username']) ?>'s Folder - Document Archival</title>
+    <title><?= htmlspecialchars($user['Username'], ENT_QUOTES, 'UTF-8') ?>'s Folder - Document Archival</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" integrity="sha512-z3gLpd7yknf1YoNbCzqRKc4qyor8gaKU1qmn+CShxbuBusANI9QpRohGBreCFkKxLhei6S9CQXFEbbKuqLg0DA==" crossorigin="anonymous" referrerpolicy="no-referrer">
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style/client-sidebar.css">
     <link rel="stylesheet" href="style/folder-page.css">
-    <style>
-        .top-nav {
-            display: flex;
-            align-items: center;
-            padding: 10px 20px;
-            background-color: #f4f4f4;
-        }
-
-        .top-nav h2 {
-            margin: 0;
-            flex-grow: 1;
-        }
-
-        .search-bar {
-            padding: 8px;
-            width: 200px;
-            margin-right: 10px;
-        }
-
-        .main-content {
-            padding: 20px;
-            transition: margin-left 0.3s ease;
-        }
-
-        .sorting-buttons {
-            margin-bottom: 15px;
-        }
-
-        .sort-btn {
-            padding: 8px 16px;
-            margin-right: 5px;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-
-        .sort-btn.active {
-            background-color: #007bff;
-            color: white;
-        }
-
-        .ftypes {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .ftype-card {
-            padding: 10px;
-            background-color: #e0e0e0;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-
-        .masonry-grid {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        .masonry-section h3 {
-            margin: 0 0 10px;
-        }
-
-        .file-card-container {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            gap: 10px;
-        }
-
-        .file-card {
-            padding: 10px;
-            background-color: #fff;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            text-align: center;
-            position: relative;
-            cursor: pointer;
-        }
-
-        .file-card.hidden {
-            display: none;
-        }
-
-        .file-icon {
-            font-size: 2em;
-        }
-
-        .file-options {
-            position: absolute;
-            top: 5px;
-            right: 5px;
-        }
-
-        .options-menu {
-            display: none;
-            position: absolute;
-            right: 0;
-            background-color: #fff;
-            border: 1px solid #ddd;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
-        }
-
-        .options-menu.show {
-            display: block;
-        }
-
-        .options-menu div {
-            padding: 8px;
-            cursor: pointer;
-        }
-
-        .options-menu div:hover {
-            background-color: #f0f0f0;
-        }
-
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-        }
-
-        .modal-content {
-            background-color: #fff;
-            margin: 10% auto;
-            padding: 20px;
-            width: 90%;
-            max-width: 800px;
-            border-radius: 8px;
-        }
-
-        .modal-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-            gap: 10px;
-        }
-
-        .close-modal {
-            float: right;
-            font-size: 1.5em;
-            cursor: pointer;
-        }
-
-        .file-info-sidebar {
-            position: fixed;
-            right: -400px;
-            top: 0;
-            width: 400px;
-            height: 100%;
-            background-color: #fff;
-            box-shadow: -2px 0 5px rgba(0, 0, 0, 0.2);
-            transition: right 0.3s ease;
-        }
-
-        .file-info-sidebar.active {
-            right: 0;
-        }
-
-        .file-name-container {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px;
-            background-color: #f4f4f4;
-        }
-
-        .file-preview iframe,
-        .file-preview img {
-            width: 100%;
-            max-height: 200px;
-        }
-
-        .file-info-header {
-            display: flex;
-            border-bottom: 1px solid #ddd;
-        }
-
-        .file-info-header div {
-            flex: 1;
-            text-align: center;
-            padding: 10px;
-            cursor: pointer;
-        }
-
-        .file-info-header .active {
-            background-color: #e0e0e0;
-        }
-
-        .info-section {
-            display: none;
-            padding: 10px;
-        }
-
-        .info-section.active {
-            display: block;
-        }
-
-        .info-item {
-            margin-bottom: 10px;
-        }
-
-        .info-label {
-            font-weight: bold;
-            margin-right: 5px;
-        }
-
-        .full-preview-modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-        }
-
-        .full-preview-content {
-            background-color: #fff;
-            margin: 5% auto;
-            padding: 20px;
-            width: 90%;
-            max-width: 1000px;
-            border-radius: 8px;
-        }
-
-        .close-full-preview {
-            float: right;
-            font-size: 1.5em;
-            cursor: pointer;
-        }
-
-        .custom-alert {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            padding: 10px;
-            border-radius: 4px;
-            z-index: 1002;
-        }
-
-        .custom-alert.success {
-            background-color: #28a745;
-            color: white;
-        }
-
-        .custom-alert.error {
-            background-color: #dc3545;
-            color: white;
-        }
-
-        #renameModal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-        }
-
-        #renameModal .modal-content {
-            background-color: #fff;
-            margin: 15% auto;
-            padding: 20px;
-            width: 90%;
-            max-width: 500px;
-            border-radius: 8px;
-        }
-    </style>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js" integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
 </head>
 
 <body>
     <div class="top-nav">
-        <h2><?= htmlspecialchars($user['Username']) ?>'s Folder</h2>
-        <input type="text" placeholder="Search documents..." class="search-bar" id="searchBar">
+        <button class="toggle-btn" title="Toggle Sidebar" aria-label="Toggle Sidebar"><i class="fas fa-bars"></i></button>
+        <h2><?= htmlspecialchars($user['Username'], ENT_QUOTES, 'UTF-8') ?>'s Folder</h2>
+        <div class="search-container">
+            <i class="fas fa-search search-icon"></i>
+            <input type="text" placeholder="Search documents..." class="search-bar" id="searchBar" aria-label="Search documents">
+        </div>
     </div>
 
     <div class="sidebar">
-        <button class="toggle-btn" title="Toggle Sidebar" aria-label="Toggle Sidebar"><i class="fas fa-bars"></i></button>
         <h2 class="sidebar-title">Document Archival</h2>
         <?php if ($userRole === 'admin'): ?>
             <a href="admin_dashboard.php" data-tooltip="Admin Dashboard"><i class="fas fa-user-shield"></i><span class="link-text">Admin Dashboard</span></a>
@@ -520,26 +249,26 @@ try {
         <a href="my-report.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-report.php' ? 'active' : '' ?>" data-tooltip="My Report"><i class="fas fa-chart-bar"></i><span class="link-text">My Report</span></a>
         <a href="my-folder.php" class="<?= basename($_SERVER['PHP_SELF']) == 'my-folder.php' ? 'active' : '' ?>" data-tooltip="My Folder"><i class="fas fa-folder"></i><span class="link-text">My Folder</span></a>
         <?php foreach ($userDepartments as $dept): ?>
-            <a href="department_folder.php?department_id=<?= htmlspecialchars($dept['id'], ENT_QUOTES, 'UTF-8') ?>" data-tooltip="<?= htmlspecialchars($dept['name']) ?>"><i class="fas fa-folder"></i><span class="link-text"><?= htmlspecialchars($dept['name']) ?></span></a>
+            <a href="department_folder.php?department_id=<?= htmlspecialchars($dept['id'], ENT_QUOTES, 'UTF-8') ?>" data-tooltip="<?= htmlspecialchars($dept['name'], ENT_QUOTES, 'UTF-8') ?>"><i class="fas fa-folder"></i><span class="link-text"><?= htmlspecialchars($dept['name'], ENT_QUOTES, 'UTF-8') ?></span></a>
         <?php endforeach; ?>
         <a href="logout.php" class="logout-btn" data-tooltip="Logout"><i class="fas fa-sign-out-alt"></i><span class="link-text">Logout</span></a>
     </div>
 
     <div class="main-content">
         <div class="sorting-buttons">
-            <button class="sort-btn <?= $sortFilter === 'all' ? 'active' : '' ?>" data-filter="all">All Files</button>
-            <button class="sort-btn <?= $sortFilter === 'uploaded-by-me' ? 'active' : '' ?>" data-filter="uploaded-by-me">Uploaded by Me</button>
-            <button class="sort-btn <?= $sortFilter === 'received' ? 'active' : '' ?>" data-filter="received">Files Received</button>
-            <button class="sort-btn <?= $sortFilter === 'hardcopy' ? 'active' : '' ?>" data-filter="hardcopy">Hardcopy</button>
-            <button class="sort-btn <?= $sortFilter === 'softcopy' ? 'active' : '' ?>" data-filter="softcopy">Softcopy</button>
+            <button class="sort-btn <?= $sortFilter === 'all' ? 'active' : '' ?>" data-filter="all" aria-label="Show all files">All Files</button>
+            <button class="sort-btn <?= $sortFilter === 'uploaded-by-me' ? 'active' : '' ?>" data-filter="uploaded-by-me" aria-label="Show files uploaded by me">Uploaded by Me</button>
+            <button class="sort-btn <?= $sortFilter === 'received' ? 'active' : '' ?>" data-filter="received" aria-label="Show received files">Files Received</button>
+            <button class="sort-btn <?= $sortFilter === 'hardcopy' ? 'active' : '' ?>" data-filter="hardcopy" aria-label="Show hardcopy files">Hardcopy</button>
+            <button class="sort-btn <?= $sortFilter === 'softcopy' ? 'active' : '' ?>" data-filter="softcopy" aria-label="Show softcopy files">Softcopy</button>
         </div>
 
         <div class="ftypes">
             <?php foreach ($documentTypes as $type):
                 $fileCount = count(array_filter($filteredFiles, fn($file) => $file['document_type'] === $type['name']));
             ?>
-                <div class="ftype-card" onclick="openModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')">
-                    <p><?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> (<?= $fileCount ?>)</p>
+                <div class="ftype-card" onclick="openModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')" tabindex="0" aria-label="<?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> (<?= $fileCount ?> files)">
+                    <p><?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> <span class="file-count">(<?= $fileCount ?>)</span></p>
                 </div>
             <?php endforeach; ?>
         </div>
@@ -549,10 +278,11 @@ try {
                 <h3>Uploaded Files</h3>
                 <div class="file-card-container" id="uploadedFiles">
                     <?php foreach (array_slice($uploadedFiles, 0, 4) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
+                        <div class="file-card" data-file-id="<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)" tabindex="0" aria-label="View details for <?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
                             <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
-                            <div class="file-options" onclick="toggleOptions(event, this)">
+                            <div class="file-type-badge"><?= htmlspecialchars($file['document_type'], ENT_QUOTES, 'UTF-8') ?></div>
+                            <div class="file-options" onclick="toggleOptions(event, this)" aria-label="File options">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
                                     <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
@@ -570,17 +300,18 @@ try {
                     <?php endforeach; ?>
                 </div>
                 <?php if (count($uploadedFiles) > 4): ?>
-                    <div class="view-more"><button onclick="openModal('uploaded')">View More</button></div>
+                    <div class="view-more"><button onclick="openModal('uploaded')" aria-label="View more uploaded files">View More</button></div>
                 <?php endif; ?>
             </div>
             <div class="masonry-section">
                 <h3>Received Files</h3>
                 <div class="file-card-container" id="receivedFiles">
                     <?php foreach (array_slice($receivedFiles, 0, 4) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
+                        <div class="file-card" data-file-id="<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)" tabindex="0" aria-label="View details for <?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
                             <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
-                            <div class="file-options" onclick="toggleOptions(event, this)">
+                            <div class="file-type-badge"><?= htmlspecialchars($file['document_type'], ENT_QUOTES, 'UTF-8') ?></div>
+                            <div class="file-options" onclick="toggleOptions(event, this)" aria-label="File options">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
                                     <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
@@ -598,7 +329,7 @@ try {
                     <?php endforeach; ?>
                 </div>
                 <?php if (count($receivedFiles) > 4): ?>
-                    <div class="view-more"><button onclick="openModal('received')">View More</button></div>
+                    <div class="view-more"><button onclick="openModal('received')" aria-label="View more received files">View More</button></div>
                 <?php endif; ?>
             </div>
         </div>
@@ -607,16 +338,12 @@ try {
     <div class="file-info-sidebar">
         <div class="file-name-container">
             <div class="file-name-title" id="sidebarFileName">File Name</div>
-            <button class="close-sidebar-btn" onclick="closeSidebar()">×</button>
+            <button class="close-sidebar-btn" onclick="closeSidebar()" aria-label="Close sidebar">×</button>
         </div>
         <div class="file-preview" id="filePreview"></div>
         <div class="file-info-header">
-            <div class="file-info-location active" onclick="showSection('locationSection')">
-                <h4>Location</h4>
-            </div>
-            <div class="file-info-details" onclick="showSection('detailsSection')">
-                <h4>Details</h4>
-            </div>
+            <div class="file-info-location active" onclick="showSection('locationSection')" aria-label="Show location details">Location</div>
+            <div class="file-info-details" onclick="showSection('detailsSection')" aria-label="Show file details">Details</div>
         </div>
         <div class="info-section active" id="locationSection">
             <div class="info-item"><span class="info-label">Department:</span><span class="info-value" id="departmentCollege">N/A</span></div>
@@ -646,7 +373,7 @@ try {
 
     <div class="full-preview-modal" id="fullPreviewModal">
         <div class="full-preview-content">
-            <button class="close-full-preview" onclick="closeFullPreview()">✕</button>
+            <button class="close-full-preview" onclick="closeFullPreview()" aria-label="Close full preview">✕</button>
             <div id="fullPreviewContent"></div>
         </div>
     </div>
@@ -654,14 +381,15 @@ try {
     <?php foreach ($documentTypes as $type): ?>
         <div id="<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>Modal" class="modal">
             <div class="modal-content">
-                <button class="close-modal" onclick="closeModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')">✕</button>
+                <button class="close-modal" onclick="closeModal('<?= htmlspecialchars(strtolower(str_replace(' ', '-', $type['name'])), ENT_QUOTES, 'UTF-8') ?>')" aria-label="Close modal">✕</button>
                 <h2><?= htmlspecialchars(ucfirst($type['name']), ENT_QUOTES, 'UTF-8') ?> Files</h2>
                 <div class="modal-grid">
                     <?php foreach (array_filter($filteredFiles, fn($file) => $file['document_type'] === $type['name']) as $file): ?>
-                        <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
+                        <div class="file-card" data-file-id="<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)" tabindex="0" aria-label="View details for <?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>">
                             <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
                             <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
-                            <div class="file-options" onclick="toggleOptions(event, this)">
+                            <div class="file-type-badge"><?= htmlspecialchars($file['document_type'], ENT_QUOTES, 'UTF-8') ?></div>
+                            <div class="file-options" onclick="toggleOptions(event, this)" aria-label="File options">
                                 <i class="fas fa-ellipsis-v"></i>
                                 <div class="options-menu">
                                     <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
@@ -684,14 +412,15 @@ try {
 
     <div id="uploadedModal" class="modal">
         <div class="modal-content">
-            <button class="close-modal" onclick="closeModal('uploaded')">✕</button>
+            <button class="close-modal" onclick="closeModal('uploaded')" aria-label="Close modal">✕</button>
             <h2>All Uploaded Files</h2>
             <div class="modal-grid">
                 <?php foreach ($uploadedFiles as $file): ?>
-                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
+                    <div class="file-card" data-file-id="<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)" tabindex="0" aria-label="View details for <?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>">
                         <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
                         <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
-                        <div class="file-options" onclick="toggleOptions(event, this)">
+                        <div class="file-type-badge"><?= htmlspecialchars($file['document_type'], ENT_QUOTES, 'UTF-8') ?></div>
+                        <div class="file-options" onclick="toggleOptions(event, this)" aria-label="File options">
                             <i class="fas fa-ellipsis-v"></i>
                             <div class="options-menu">
                                 <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
@@ -713,14 +442,15 @@ try {
 
     <div id="receivedModal" class="modal">
         <div class="modal-content">
-            <button class="close-modal" onclick="closeModal('received')">✕</button>
+            <button class="close-modal" onclick="closeModal('received')" aria-label="Close modal">✕</button>
             <h2>All Received Files</h2>
             <div class="modal-grid">
                 <?php foreach ($receivedFiles as $file): ?>
-                    <div class="file-card" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">
+                    <div class="file-card" data-file-id="<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>" data-file-name="<?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>" onclick="openSidebar(<?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)" tabindex="0" aria-label="View details for <?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?>">
                         <div class="file-icon-container"><i class="<?= getFileIcon($file['file_name']) ?> file-icon"></i></div>
                         <p class="file-name"><?= htmlspecialchars($file['file_name'], ENT_QUOTES, 'UTF-8') ?></p>
-                        <div class="file-options" onclick="toggleOptions(event, this)">
+                        <div class="file-type-badge"><?= htmlspecialchars($file['document_type'], ENT_QUOTES, 'UTF-8') ?></div>
+                        <div class="file-options" onclick="toggleOptions(event, this)" aria-label="File options">
                             <i class="fas fa-ellipsis-v"></i>
                             <div class="options-menu">
                                 <div onclick="handleOption('Rename', <?= htmlspecialchars($file['id'], ENT_QUOTES, 'UTF-8') ?>)">Rename</div>
@@ -742,14 +472,14 @@ try {
 
     <div id="renameModal" class="modal">
         <div class="modal-content">
-            <button class="close-modal" onclick="closeModal('rename')">✕</button>
+            <button class="close-modal" onclick="closeModal('rename')" aria-label="Close rename modal">✕</button>
             <h2>Rename File</h2>
             <form id="renameForm">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
                 <input type="hidden" name="file_id" id="renameFileId">
                 <label for="renameFileName">New File Name:</label>
-                <input type="text" id="renameFileName" name="new_name" required maxlength="255">
-                <button type="submit">Rename</button>
+                <input type="text" id="renameFileName" name="new_name" required maxlength="255" aria-label="New file name">
+                <button type="submit" aria-label="Submit rename">Rename</button>
             </form>
         </div>
     </div>
@@ -943,10 +673,10 @@ try {
                     if (data.data.file_path) {
                         const ext = data.data.file_type.toLowerCase();
                         if (ext === 'pdf') {
-                            elements.filePreview.innerHTML = `<iframe src="${data.data.file_path}" title="File Preview"></iframe><p>Click to view full file${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
+                            elements.filePreview.innerHTML = `<iframe src="${data.data.file_path}" title="File Preview" aria-label="File preview"></iframe><p>Click to view full file${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
                             elements.filePreview.querySelector('iframe').addEventListener('click', () => openFullPreview(data.data.file_path));
                         } else if (['jpg', 'png', 'jpeg', 'gif'].includes(ext)) {
-                            elements.filePreview.innerHTML = `<img src="${data.data.file_path}" alt="File Preview"><p>Click to view full image${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
+                            elements.filePreview.innerHTML = `<img src="${data.data.file_path}" alt="File Preview" aria-label="Image preview"><p>Click to view full image${data.data.hard_copy_available ? ' (Hardcopy available)' : ''}</p>`;
                             elements.filePreview.querySelector('img').addEventListener('click', () => openFullPreview(data.data.file_path));
                         } else {
                             elements.filePreview.innerHTML = '<p>Preview not available for this file type</p>';
@@ -1107,12 +837,15 @@ try {
                 return;
             }
             const ext = filePath.split('.').pop().toLowerCase();
-            content.innerHTML = ['pdf'].includes(ext) ? `<iframe src="${filePath}"></iframe>` : `<img src="${filePath}" style="max-width: 100%; max-height: 80vh;">`;
+            content.innerHTML = ['pdf'].includes(ext) ? `<iframe src="${filePath}" aria-label="Full file preview"></iframe>` : `<img src="${filePath}" style="max-width: 100%; max-height: 80vh;" alt="Full image preview" aria-label="Full image preview">`;
             modal.style.display = 'flex';
+            modal.classList.add('open');
         }
 
         function closeFullPreview() {
-            document.getElementById('fullPreviewModal').style.display = 'none';
+            const modal = document.getElementById('fullPreviewModal');
+            modal.classList.remove('open');
+            setTimeout(() => modal.style.display = 'none', 300);
         }
 
         // Sidebar section toggle
@@ -1144,7 +877,7 @@ try {
                 if (noResults) noResults.remove();
                 if (!hasResults && searchQuery) {
                     const container = document.getElementById(containerId);
-                    container.insertAdjacentHTML('beforeend', `<p id="noResults-${containerId}" style="text-align: center;">No files found</p>`);
+                    container.insertAdjacentHTML('beforeend', `<p id="noResults-${containerId}" class="no-results">No files found</p>`);
                 }
             });
         }
@@ -1175,7 +908,7 @@ try {
             alertDiv.className = `custom-alert ${type}`;
             alertDiv.innerHTML = `
                 <p>${message}</p>
-                <button onclick="this.parentElement.remove(); ${callback ? 'callback()' : ''}">OK</button>
+                <button onclick="this.parentElement.remove(); ${callback ? 'callback()' : ''}" aria-label="Close alert">OK</button>
             `;
             document.body.appendChild(alertDiv);
             setTimeout(() => alertDiv.remove(), 5000);
