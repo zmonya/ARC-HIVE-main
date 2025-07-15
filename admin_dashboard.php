@@ -2,8 +2,28 @@
 session_start();
 require 'db_connection.php';
 
+// Security headers
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('X-XSS-Protection: 1; mode=block');
+
+// CSRF token generation and validation
+function generateCsrfToken()
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+// Validate CSRF token
+function validateCsrfToken($token)
+{
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
 // Redirect to login if not authenticated or not an admin
-if (!isset($_SESSION['user_id'])) {
+if (!isset($_SESSION['user_id']) || !isset($_SESSION['role'])) {
     header('Location: login.php');
     exit();
 }
@@ -13,99 +33,133 @@ if ($_SESSION['role'] !== 'admin') {
     exit();
 }
 
-$userId = $_SESSION['user_id'];
+$userId = filter_var($_SESSION['user_id'], FILTER_VALIDATE_INT);
+if ($userId === false) {
+    session_destroy();
+    header('Location: login.php');
+    exit();
+}
+
+// Function to execute prepared queries safely
+function executeQuery($pdo, $query, $params = [])
+{
+    try {
+        $stmt = $pdo->prepare($query);
+        $stmt->execute($params);
+        return $stmt;
+    } catch (PDOException $e) {
+        error_log("Database error: " . $e->getMessage());
+        return false;
+    }
+}
 
 // Fetch admin details
-$stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
-$stmt->execute([$userId]);
-$admin = $stmt->fetch(PDO::FETCH_ASSOC);
+$adminStmt = executeQuery($pdo, "SELECT User_id, Username, Role FROM users WHERE User_id = ?", [$userId]);
+$admin = $adminStmt ? $adminStmt->fetch(PDO::FETCH_ASSOC) : null;
+
+if (!$admin) {
+    session_destroy();
+    header('Location: login.php');
+    exit();
+}
 
 // Fetch system statistics
-$totalUsers = $pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
-$totalFiles = $pdo->query("SELECT COUNT(*) FROM files WHERE is_deleted = 0")->fetchColumn();
-$pendingRequests = $pdo->query("SELECT COUNT(*) FROM access_requests WHERE status = 'pending'")->fetchColumn();
+$totalUsersStmt = executeQuery($pdo, "SELECT COUNT(*) FROM users");
+$totalUsers = $totalUsersStmt ? $totalUsersStmt->fetchColumn() : 0;
 
-// Fetch incoming and outgoing files from file_transfers
-$incomingFiles = $pdo->query("
+$totalFilesStmt = executeQuery($pdo, "SELECT COUNT(*) FROM files WHERE File_status != 'deleted'");
+$totalFiles = $totalFilesStmt ? $totalFilesStmt->fetchColumn() : 0;
+
+// Fetch pending access requests (assuming transaction table for access requests)
+$pendingRequestsStmt = executeQuery($pdo, "SELECT COUNT(*) FROM transaction WHERE Transaction_status = 'pending' AND Transaction_type = 5");
+$pendingRequests = $pendingRequestsStmt ? $pendingRequestsStmt->fetchColumn() : 0;
+
+// Fetch incoming and outgoing files
+$incomingFilesStmt = executeQuery($pdo, "
     SELECT COUNT(*) AS incoming_count 
-    FROM file_transfers 
-    WHERE recipient_id = $userId AND status = 'pending'
-")->fetchColumn();
+    FROM transaction t
+    JOIN files f ON t.File_id = f.File_id
+    WHERE t.Users_Department_id IN (SELECT Department_id FROM users_department WHERE User_id = ?) 
+    AND t.Transaction_status = 'pending' 
+    AND t.Transaction_type = 4", [$userId]);
+$incomingFiles = $incomingFilesStmt ? $incomingFilesStmt->fetchColumn() : 0;
 
-$outgoingFiles = $pdo->query("
+$outgoingFilesStmt = executeQuery($pdo, "
     SELECT COUNT(*) AS outgoing_count 
-    FROM file_transfers 
-    WHERE sender_id = $userId AND status = 'pending'
-")->fetchColumn();
+    FROM transaction t
+    JOIN files f ON t.File_id = f.File_id
+    WHERE t.User_id = ? 
+    AND t.Transaction_status = 'pending' 
+    AND t.Transaction_type = 4", [$userId]);
+$outgoingFiles = $outgoingFilesStmt ? $outgoingFilesStmt->fetchColumn() : 0;
 
-// Fetch file upload trends (Last 7 Days) with uploader and department details
-$fileUploadTrends = $pdo->query("
+// Fetch file upload trends (Last 7 Days)
+$fileUploadTrendsStmt = executeQuery($pdo, "
     SELECT 
-        f.file_name AS document_name,
-        dt.name AS document_type,
-        f.upload_date AS upload_date,
-        u.username AS uploader_name,
-        d.name AS uploader_department,
-        sd.name AS uploader_subdepartment,
-        ft.department_id AS target_department_id,
-        td.name AS target_department_name
+        f.File_name AS document_name,
+        dt.Field_label AS document_type,
+        f.Upload_date AS upload_date,
+        u.Username AS uploader_name,
+        d.Department_name AS uploader_department,
+        sd.Department_name AS uploader_subdepartment,
+        td.Department_name AS target_department_name
     FROM files f
-    LEFT JOIN document_types dt ON f.document_type_id = dt.id
-    LEFT JOIN users u ON f.user_id = u.id
-    LEFT JOIN user_department_affiliations uda ON u.id = uda.user_id
-    LEFT JOIN departments d ON uda.department_id = d.id
-    LEFT JOIN sub_departments sd ON uda.sub_department_id = sd.id
-    LEFT JOIN file_transfers ft ON f.id = ft.file_id AND ft.time_sent = f.upload_date
-    LEFT JOIN departments td ON ft.department_id = td.id
-    WHERE f.upload_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
-    ORDER BY f.upload_date ASC
-")->fetchAll(PDO::FETCH_ASSOC);
+    LEFT JOIN documents_type_fields dt ON f.Document_type_id = dt.Document_type_id
+    LEFT JOIN users u ON f.User_id = u.User_id
+    LEFT JOIN users_department uda ON u.User_id = uda.User_id
+    LEFT JOIN departments d ON uda.Department_Absid = d.Department_id
+    LEFT JOIN departments sd ON d.Department_id = sd.Department_id AND sd.Department_type = 'sub_department'
+    LEFT JOIN transaction t ON f.File_id = t.File_id
+    LEFT JOIN departments td ON t.Users_Department_id = td.Department_id
+    WHERE f.Upload_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+    AND f.File_status != 'deleted'
+    ORDER BY f.Upload_date ASC");
+$fileUploadTrends = $fileUploadTrendsStmt ? $fileUploadTrendsStmt->fetchAll(PDO::FETCH_ASSOC) : [];
 
-// Fetch file distribution by document type (only files with activity)
-$fileDistributionByType = $pdo->query("
+// Fetch file distribution by document type
+$fileDistributionByTypeStmt = executeQuery($pdo, "
     SELECT 
-        f.file_name AS document_name,
-        dt.name AS document_type,
-        us.username AS sender_name,
-        ur.username AS receiver_name,
-        ft.time_sent AS time_sent,
-        ft.time_received AS time_received,
-        ft.time_accepted AS time_accepted,
-        ft.time_denied AS time_denied,
-        uq.username AS requester_name,
-        uo.username AS owner_name,
-        ar.time_requested AS time_requested,
-        ar.time_approved AS time_approved,
-        ar.time_rejected AS time_rejected,
-        d.name AS department_name,
-        sd.name AS sub_department_name
+        f.File_name AS document_name,
+        dt.Field_label AS document_type,
+        us.Username AS sender_name,
+        ur.Username AS receiver_name,
+        t.Time AS time_sent,
+        t2.Time AS time_received,
+        uq.Username AS requester_name,
+        uo.Username AS owner_name,
+        t3.Time AS time_requested,
+        t4.Time AS time_approved,
+        d.Department_name AS department_name,
+        sd.Department_name AS sub_department_name
     FROM files f
-    JOIN document_types dt ON f.document_type_id = dt.id
-    LEFT JOIN file_transfers ft ON f.id = ft.file_id
-    LEFT JOIN users us ON ft.sender_id = us.id
-    LEFT JOIN users ur ON ft.recipient_id = ur.id
-    LEFT JOIN access_requests ar ON f.id = ar.file_id
-    LEFT JOIN users uq ON ar.requester_id = uq.id
-    LEFT JOIN users uo ON ar.owner_id = uo.id
-    LEFT JOIN user_department_affiliations uda ON ft.sender_id = uda.user_id
-    LEFT JOIN departments d ON uda.department_id = d.id
-    LEFT JOIN sub_departments sd ON uda.sub_department_id = sd.id
-    WHERE f.is_deleted = 0
-    AND (ft.id IS NOT NULL OR ar.id IS NOT NULL)
-    GROUP BY f.id, ft.id, ar.id
-")->fetchAll(PDO::FETCH_ASSOC);
+    JOIN documents_type_fields dt ON f.Document_type_id = dt.Document_type_id
+    LEFT JOIN transaction t ON f.File_id = t.File_id AND t.Transaction_type = 4
+    LEFT JOIN users us ON t.User_id = us.User_id
+    LEFT JOIN transaction t2 ON f.File_id = t2.File_id AND t2.Transaction_type = 6
+    LEFT JOIN users ur ON t2.User_id = ur.User_id
+    LEFT JOIN transaction t3 ON f.File_id = t3.File_id AND t3.Transaction_type = 5
+    LEFT JOIN users uq ON t3.User_id = uq.User_id
+    LEFT JOIN users uo ON f.User_id = uo.User_id
+    LEFT JOIN users_department uda ON t.User_id = uda.User_id
+    LEFT JOIN departments d ON uda.Department_id = d.Department_id
+    LEFT JOIN departments sd ON d.Department_id = sd.Department_id AND sd.Department_type = 'sub_department'
+    WHERE f.File_status != 'deleted'
+    AND (t.Transaction_id IS NOT NULL OR t3.Transaction_id IS NOT NULL)
+    GROUP BY f.File_id, t.Transaction_id, t3.Transaction_id");
+$fileDistributionByType = $fileDistributionByTypeStmt ? $fileDistributionByTypeStmt->fetchAll(PDO::FETCH_ASSOC) : [];
 
 // Fetch users per department
-$usersPerDepartment = $pdo->query("
+$usersPerDepartmentStmt = executeQuery($pdo, "
     SELECT 
-        d.name AS department_name,
-        COUNT(DISTINCT uda.user_id) AS user_count
+        d.Department_name AS department_name,
+        COUNT(DISTINCT uda.User_id) AS user_count
     FROM departments d
-    LEFT JOIN user_department_affiliations uda ON d.id = uda.department_id
-    GROUP BY d.name
-")->fetchAll(PDO::FETCH_ASSOC);
+    LEFT JOIN users_department uda ON d.Department_id = uda.Department_id
+    WHERE d.Department_type = 'college' OR d.Department_type = 'office'
+    GROUP BY d.Department_name");
+$usersPerDepartment = $usersPerDepartmentStmt ? $usersPerDepartmentStmt->fetchAll(PDO::FETCH_ASSOC) : [];
 
-// Prepare data for Users Per Department chart
+// Prepare data for charts
 $departmentLabels = array_column($usersPerDepartment, 'department_name');
 $departmentData = array_column($usersPerDepartment, 'user_count');
 ?>
@@ -116,19 +170,19 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>Admin Dashboard - Arc-Hive</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" integrity="sha512-z3gLpd7yknf1YoNbCzqRKc4qyor8gaKU1qmn+CShxbuBusANI9QpRohGBreCFkKxLhei6S9CQXFEbbKuqLg0DA==" crossorigin="anonymous" referrerpolicy="no-referrer">
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/notyf@3/notyf.min.css">
     <script src="https://cdn.jsdelivr.net/npm/notyf@3/notyf.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" integrity="sha512-qZvrmS2ekKPF2mSznTQsxqPgnpkI4DNTlrdUmTzrDgektczlKNRRhy5X5AAOnx5S09ydFYWWNSfcEqDTTHgtNA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <link rel="stylesheet" href="styles.css">
     <link rel="stylesheet" href="admin-sidebar.css">
     <link rel="stylesheet" href="admin-interface.css">
     <style>
-        /* Popup Styling */
         .popup-overlay {
             display: none;
             position: fixed;
@@ -236,7 +290,6 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
             background-color: #f8f8f8;
             color: #444;
             font-weight: bold;
-            /* Bold headers */
         }
 
         .popup-table td {
@@ -245,10 +298,8 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
 
         .popup-table td:nth-child(odd) {
             background-color: #e6f4ea;
-            /* Pastel Emerald Green */
         }
 
-        /* Stat Card Enhancements */
         .stat-card {
             transition: transform 0.2s, box-shadow 0.2s;
         }
@@ -258,7 +309,6 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
             box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
         }
 
-        /* Chart Container Enhancements */
         .chart-container {
             cursor: pointer;
             transition: transform 0.2s, box-shadow 0.2s;
@@ -326,45 +376,43 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
 
     <!-- Main Content -->
     <div class="main-content sidebar-expanded">
+        <!-- CSRF Token -->
+        <input type="hidden" id="csrf_token" value="<?= htmlspecialchars(generateCsrfToken(), ENT_QUOTES, 'UTF-8') ?>">
+
         <!-- System Statistics -->
         <div class="admin-stats">
             <div class="stat-card">
                 <h3>Total Users</h3>
-                <p><?= $totalUsers ?></p>
+                <p><?= htmlspecialchars($totalUsers, ENT_QUOTES, 'UTF-8') ?></p>
             </div>
             <div class="stat-card">
                 <h3>Total Files</h3>
-                <p><?= $totalFiles ?></p>
+                <p><?= htmlspecialchars($totalFiles, ENT_QUOTES, 'UTF-8') ?></p>
             </div>
             <div class="stat-card">
                 <h3>Pending Requests</h3>
-                <p><?= $pendingRequests ?></p>
+                <p><?= htmlspecialchars($pendingRequests, ENT_QUOTES, 'UTF-8') ?></p>
             </div>
             <div class="stat-card">
                 <h3>Incoming Files</h3>
-                <p><?= $incomingFiles ?></p>
+                <p><?= htmlspecialchars($incomingFiles, ENT_QUOTES, 'UTF-8') ?></p>
             </div>
             <div class="stat-card">
                 <h3>Outgoing Files</h3>
-                <p><?= $outgoingFiles ?></p>
+                <p><?= htmlspecialchars($outgoingFiles, ENT_QUOTES, 'UTF-8') ?></p>
             </div>
         </div>
 
         <!-- Charts Grid -->
         <div class="chart-grid">
-            <!-- File Upload Trends -->
             <div class="chart-container" onclick="openPopup('fileUploadChart', 'File Upload Trends (Last 7 Days)', 'FileUploadTrends')">
                 <h3>File Upload Trends (Last 7 Days)</h3>
                 <canvas id="fileUploadChart"></canvas>
             </div>
-
-            <!-- File Distribution by Document Type -->
             <div class="chart-container" onclick="openPopup('fileDistributionChart', 'File Distribution by Document Type', 'FileDistribution')">
                 <h3>File Distribution by Document Type</h3>
                 <canvas id="fileDistributionChart"></canvas>
             </div>
-
-            <!-- Users Per Department -->
             <div class="chart-container" onclick="openPopup('usersPerDepartmentChart', 'Users Per Department', 'UsersPerDepartment')">
                 <h3>Users Per Department</h3>
                 <canvas id="usersPerDepartmentChart"></canvas>
@@ -389,7 +437,20 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
     </div>
 
     <script>
-        // Toggle Sidebar and Popup Close
+        // CSRF Token
+        const csrfToken = document.getElementById('csrf_token').value;
+
+        // Initialize Notyf for notifications
+        const notyf = new Notyf({
+            duration: 5000,
+            position: {
+                x: 'right',
+                y: 'top'
+            },
+            ripple: true
+        });
+
+        // Toggle Sidebar
         document.addEventListener('DOMContentLoaded', () => {
             const sidebar = document.querySelector('.sidebar');
             const mainContent = document.querySelector('.main-content');
@@ -423,8 +484,11 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
         let fileUploadChart, fileDistributionChart, usersPerDepartmentChart, popupChartInstance;
 
         function initCharts() {
-            const fileUploadTrends = <?= json_encode($fileUploadTrends) ?>;
-            const uploadLabels = fileUploadTrends.map(entry => new Date(entry.upload_date).toLocaleDateString());
+            const fileUploadTrends = <?= json_encode($fileUploadTrends, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+            const uploadLabels = fileUploadTrends.map(entry => new Date(entry.upload_date).toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric'
+            }));
             const uploadData = fileUploadTrends.map(() => 1);
 
             fileUploadChart = new Chart(document.getElementById('fileUploadChart'), {
@@ -444,13 +508,23 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                     maintainAspectRatio: false,
                     scales: {
                         y: {
-                            beginAtZero: true
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Number of Uploads'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Date'
+                            }
                         }
                     }
                 }
             });
 
-            const fileDistributionByType = <?= json_encode($fileDistributionByType) ?>;
+            const fileDistributionByType = <?= json_encode($fileDistributionByType, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
             const documentTypeLabels = [...new Set(fileDistributionByType.map(entry => entry.document_type))];
             const documentTypeData = documentTypeLabels.map(type =>
                 fileDistributionByType.filter(entry => entry.document_type === type).length
@@ -468,17 +542,22 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 },
                 options: {
                     responsive: true,
-                    maintainAspectRatio: false
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        }
+                    }
                 }
             });
 
             usersPerDepartmentChart = new Chart(document.getElementById('usersPerDepartmentChart'), {
                 type: 'bar',
                 data: {
-                    labels: <?= json_encode($departmentLabels) ?>,
+                    labels: <?= json_encode($departmentLabels, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>,
                     datasets: [{
                         label: 'Users',
-                        data: <?= json_encode($departmentData) ?>,
+                        data: <?= json_encode($departmentData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>,
                         backgroundColor: '#50c878',
                         borderColor: '#50c878',
                         borderWidth: 2
@@ -515,6 +594,11 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
         let currentChartType;
 
         function openPopup(chartId, title, chartType) {
+            if (!validateCsrfToken(csrfToken)) {
+                notyf.error('Invalid CSRF token');
+                return;
+            }
+
             currentChartType = chartType;
             const popupOverlay = document.getElementById('popupOverlay');
             const popupTitle = document.getElementById('popupTitle');
@@ -558,11 +642,11 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                             const destination = entry.target_department_name ? entry.target_department_name : '(NONE) Personal Document';
                             return `
                                 <tr>
-                                    <td>${entry.document_name}</td>
-                                    <td>${entry.document_type}</td>
-                                    <td>${entry.uploader_name}</td>
-                                    <td>${dept}</td>
-                                    <td>${destination}</td>
+                                    <td>${sanitizeHTML(entry.document_name)}</td>
+                                    <td>${sanitizeHTML(entry.document_type)}</td>
+                                    <td>${sanitizeHTML(entry.uploader_name)}</td>
+                                    <td>${sanitizeHTML(dept)}</td>
+                                    <td>${sanitizeHTML(destination)}</td>
                                     <td>${new Date(entry.upload_date).toLocaleString()}</td>
                                 </tr>
                             `;
@@ -587,19 +671,19 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                             const dept = entry.department_name ? `${entry.department_name}${entry.sub_department_name ? ' - ' + entry.sub_department_name : ''}` : 'None';
                             return `
                                 <tr>
-                                    <td>${entry.document_name}</td>
-                                    <td>${entry.document_type}</td>
-                                    <td>${entry.sender_name || 'None'}</td>
-                                    <td>${entry.receiver_name || 'None'}</td>
+                                    <td>${sanitizeHTML(entry.document_name)}</td>
+                                    <td>${sanitizeHTML(entry.document_type)}</td>
+                                    <td>${sanitizeHTML(entry.sender_name || 'None')}</td>
+                                    <td>${sanitizeHTML(entry.receiver_name || 'None')}</td>
                                     <td>${entry.time_sent ? new Date(entry.time_sent).toLocaleString() : 'Not Sent'}</td>
                                     <td>${entry.time_received ? new Date(entry.time_received).toLocaleString() : 'Not Received'}</td>
-                                    <td>${dept}</td>
+                                    <td>${sanitizeHTML(dept)}</td>
                                 </tr>
                                 ${entry.requester_name ? `
                                 <tr>
                                     <td colspan="2">Access Request</td>
-                                    <td>${entry.requester_name}</td>
-                                    <td>${entry.owner_name || 'None'}</td>
+                                    <td>${sanitizeHTML(entry.requester_name)}</td>
+                                    <td>${sanitizeHTML(entry.owner_name || 'None')}</td>
                                     <td>${entry.time_requested ? new Date(entry.time_requested).toLocaleString() : 'Not Requested'}</td>
                                     <td>${entry.time_approved ? new Date(entry.time_approved).toLocaleString() : 'Not Approved'}</td>
                                     <td>-</td>
@@ -620,8 +704,8 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                     <tbody>
                         ${chartData.labels.map((label, index) => `
                             <tr>
-                                <td>${label}</td>
-                                <td>${chartData.data[index]}</td>
+                                <td>${sanitizeHTML(label)}</td>
+                                <td>${sanitizeHTML(String(chartData.data[index]))}</td>
                             </tr>
                         `).join('')}
                     </tbody>
@@ -642,20 +726,32 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
 
         function getChartData(chartType) {
             if (chartType === 'FileUploadTrends') {
-                return <?= json_encode($fileUploadTrends) ?>;
+                return <?= json_encode($fileUploadTrends, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
             } else if (chartType === 'FileDistribution') {
-                return <?= json_encode($fileDistributionByType) ?>;
+                return <?= json_encode($fileDistributionByType, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
             } else if (chartType === 'UsersPerDepartment') {
                 return {
-                    labels: <?= json_encode($departmentLabels) ?>,
-                    data: <?= json_encode($departmentData) ?>
+                    labels: <?= json_encode($departmentLabels, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>,
+                    data: <?= json_encode($departmentData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>
                 };
             }
             return [];
         }
 
-        // Download Chart as PDF (Chart sizing copied from printChart)
+        // Sanitize HTML to prevent XSS
+        function sanitizeHTML(str) {
+            const div = document.createElement('div');
+            div.textContent = str || '';
+            return div.innerHTML;
+        }
+
+        // Download Chart as PDF
         function downloadChart() {
+            if (!validateCsrfToken(csrfToken)) {
+                notyf.error('Invalid CSRF token');
+                return;
+            }
+
             const chartData = getChartData(currentChartType);
             const {
                 jsPDF
@@ -663,8 +759,8 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
             const pdf = new jsPDF('p', 'mm', 'a4');
             const pageWidth = pdf.internal.pageSize.getWidth();
             const pageHeight = pdf.internal.pageSize.getHeight();
-            const margin = 5; // Kept from original
-            const maxWidth = pageWidth - 2 * margin; // 200mm
+            const margin = 5;
+            const maxWidth = pageWidth - 2 * margin;
             let yPos = 10;
 
             // Title
@@ -673,15 +769,15 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
             pdf.text(`Report: ${currentChartType}`, margin, yPos);
             yPos += 8;
 
-            // Chart Image (Copied sizing approach from printChart)
+            // Chart Image
             const chartCanvas = document.getElementById('popupChart');
             html2canvas(chartCanvas, {
                 scale: 2
             }).then(canvas => {
                 const chartImage = canvas.toDataURL('image/png');
                 const imgProps = pdf.getImageProperties(chartImage);
-                const chartWidth = maxWidth; // Full width like printChart
-                const chartHeight = (imgProps.height * chartWidth) / imgProps.width; // Maintain aspect ratio
+                const chartWidth = maxWidth;
+                const chartHeight = (imgProps.height * chartWidth) / imgProps.width;
                 pdf.addImage(chartImage, 'PNG', margin, yPos, chartWidth, chartHeight);
                 yPos += chartHeight + 8;
 
@@ -690,7 +786,7 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 pdf.text('Data Table', margin, yPos);
                 yPos += 6;
 
-                // Table Content (Original design retained)
+                // Table Content
                 pdf.setFontSize(8);
                 const lineHeight = 4;
                 const startX = margin;
@@ -702,13 +798,13 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
 
                 function drawCell(x, y, width, height, isHeader = false, isOdd = false) {
                     if (isHeader) {
-                        pdf.setFillColor(240, 240, 240); // #f0f0f0
+                        pdf.setFillColor(240, 240, 240);
                         pdf.rect(x, y, width, height, 'F');
                     } else if (isOdd) {
-                        pdf.setFillColor(230, 244, 234); // #e6f4ea
+                        pdf.setFillColor(230, 244, 234);
                         pdf.rect(x, y, width, height, 'F');
                     }
-                    pdf.setDrawColor(150, 150, 150); // Gray borders
+                    pdf.setDrawColor(150, 150, 150);
                     pdf.rect(x, y, width, height);
                 }
 
@@ -724,7 +820,7 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 }
 
                 if (currentChartType === 'FileUploadTrends') {
-                    const columnWidths = [40, 24, 24, 35, 40, 37]; // 200mm total
+                    const columnWidths = [40, 24, 24, 35, 40, 37];
                     let xPos = startX;
                     for (let i = 0; i < 6; i++) {
                         drawCell(xPos, yPos, columnWidths[i], lineHeight + 2, true);
@@ -801,7 +897,7 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                         yPos += rowHeight;
                     });
                 } else if (currentChartType === 'FileDistribution') {
-                    const columnWidths = [29, 24, 29, 29, 33, 33, 23]; // 200mm total
+                    const columnWidths = [29, 24, 29, 29, 33, 33, 23];
                     let xPos = startX;
                     for (let i = 0; i < 7; i++) {
                         drawCell(xPos, yPos, columnWidths[i], lineHeight + 2, true);
@@ -907,7 +1003,7 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                         }
                     });
                 } else if (currentChartType === 'UsersPerDepartment') {
-                    const columnWidths = [135, 65]; // 200mm total
+                    const columnWidths = [135, 65];
                     let xPos = startX;
                     for (let i = 0; i < 2; i++) {
                         drawCell(xPos, yPos, columnWidths[i], lineHeight + 2, true);
@@ -963,12 +1059,17 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 pdf.save(`${currentChartType}_Report.pdf`);
             }).catch(error => {
                 console.error('Error generating PDF:', error);
-                alert('Failed to generate PDF. Please try again.');
+                notyf.error('Failed to generate PDF. Please try again.');
             });
         }
 
-        // Print Chart (Table design fully copied from downloadChart with forced background colors)
+        // Print Chart
         function printChart() {
+            if (!validateCsrfToken(csrfToken)) {
+                notyf.error('Invalid CSRF token');
+                return;
+            }
+
             const chartData = getChartData(currentChartType);
             const chartCanvas = document.getElementById('popupChart');
 
@@ -985,11 +1086,11 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                         const destination = entry.target_department_name ? entry.target_department_name : '(NONE) Personal Document';
                         return `
                             <tr>
-                                <td>${entry.document_name}</td>
-                                <td>${entry.document_type}</td>
-                                <td>${entry.uploader_name}</td>
-                                <td>${dept}</td>
-                                <td>${destination}</td>
+                                <td>${sanitizeHTML(entry.document_name)}</td>
+                                <td>${sanitizeHTML(entry.document_type)}</td>
+                                <td>${sanitizeHTML(entry.uploader_name)}</td>
+                                <td>${sanitizeHTML(dept)}</td>
+                                <td>${sanitizeHTML(destination)}</td>
                                 <td>${new Date(entry.upload_date).toLocaleString()}</td>
                             </tr>
                         `;
@@ -999,19 +1100,19 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                         const dept = entry.department_name ? `${entry.department_name}${entry.sub_department_name ? ' - ' + entry.sub_department_name : ''}` : 'None';
                         return `
                             <tr>
-                                <td>${entry.document_name}</td>
-                                <td>${entry.document_type}</td>
-                                <td>${entry.sender_name || 'None'}</td>
-                                <td>${entry.receiver_name || 'None'}</td>
+                                <td>${sanitizeHTML(entry.document_name)}</td>
+                                <td>${sanitizeHTML(entry.document_type)}</td>
+                                <td>${sanitizeHTML(entry.sender_name || 'None')}</td>
+                                <td>${sanitizeHTML(entry.receiver_name || 'None')}</td>
                                 <td>${entry.time_sent ? new Date(entry.time_sent).toLocaleString() : 'Not Sent'}</td>
                                 <td>${entry.time_received ? new Date(entry.time_received).toLocaleString() : 'Not Received'}</td>
-                                <td>${dept}</td>
+                                <td>${sanitizeHTML(dept)}</td>
                             </tr>
                             ${entry.requester_name ? `
                             <tr>
                                 <td colspan="2">Access Request</td>
-                                <td>${entry.requester_name}</td>
-                                <td>${entry.owner_name || 'None'}</td>
+                                <td>${sanitizeHTML(entry.requester_name)}</td>
+                                <td>${sanitizeHTML(entry.owner_name || 'None')}</td>
                                 <td>${entry.time_requested ? new Date(entry.time_requested).toLocaleString() : 'Not Requested'}</td>
                                 <td>${entry.time_approved ? new Date(entry.time_approved).toLocaleString() : 'Not Approved'}</td>
                                 <td>-</td>
@@ -1022,8 +1123,8 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 } else if (currentChartType === 'UsersPerDepartment') {
                     tableRows = chartData.labels.map((label, index) => `
                         <tr>
-                            <td>${label}</td>
-                            <td>${chartData.data[index]}</td>
+                            <td>${sanitizeHTML(label)}</td>
+                            <td>${sanitizeHTML(String(chartData.data[index]))}</td>
                         </tr>
                     `).join('');
                 }
@@ -1041,13 +1142,11 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                                 th, td { border: 1px solid #969696; padding: 4px; text-align: center; }
                                 th { background-color: #f0f0f0 !important; font-weight: bold; color: #323232; }
                                 td { color: #000000; }
-                                /* Alternating colors for odd-numbered columns */
                                 td:nth-child(1), td:nth-child(3), td:nth-child(5) { background-color: #e6f4ea !important; }
-                                /* Ensure even-numbered columns have no background */
                                 td:nth-child(2), td:nth-child(4), td:nth-child(6), td:nth-child(7) { background-color: transparent !important; }
-                                @media print { 
-                                    body { margin: 0; } 
-                                    img { max-width: 100%; } 
+                                @media print {
+                                    body { margin: 0; }
+                                    img { max-width: 100%; }
                                     table { font-size: 8pt; }
                                     th { background-color: #f0f0f0 !important; -webkit-print-color-adjust: exact; color-adjust: exact; }
                                     td:nth-child(1), td:nth-child(3), td:nth-child(5) { background-color: #e6f4ea !important; -webkit-print-color-adjust: exact; color-adjust: exact; }
@@ -1098,7 +1197,7 @@ $departmentData = array_column($usersPerDepartment, 'user_count');
                 };
             }).catch(error => {
                 console.error('Error generating print content:', error);
-                alert('Failed to generate print preview. Please try again.');
+                notyf.error('Failed to generate print preview. Please try again.');
             });
         }
     </script>
