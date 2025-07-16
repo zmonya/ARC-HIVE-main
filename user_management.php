@@ -863,15 +863,17 @@ try {
                 fetch(`get_user_data.php?user_id=<?php echo htmlspecialchars($_GET['edit'], ENT_QUOTES, 'UTF-8'); ?>&csrf_token=<?php echo htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8'); ?>`)
                     .then(response => response.json())
                     .then(data => {
+                        console.log('Fetch user data response:', data);
                         if (data.success) {
-                            document.getElementById('username').value = data.user.username;
-                            document.getElementById('position').value = data.user.position;
-                            document.getElementById('role').value = data.user.role;
-                            if (data.user.profile_pic) {
-                                profilePicPreview.src = `data:image/png;base64,${data.user.profile_pic}`;
+                            const user = data.data.user;
+                            document.getElementById('username').value = user.username;
+                            document.getElementById('position').value = user.position;
+                            document.getElementById('role').value = user.role;
+                            if (user.profile_pic) {
+                                profilePicPreview.src = `data:image/png;base64,${user.profile_pic}`;
                             }
 
-                            data.user.departments.forEach(dept => {
+                            user.departments.forEach(dept => {
                                 const item = document.querySelector(`.department-item[data-id="${dept.department_id}"]`);
                                 if (item) {
                                     selectedDepartments.add(dept.department_id);
